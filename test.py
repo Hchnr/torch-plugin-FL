@@ -15,8 +15,8 @@ print(f"Registered FlagGems ops: {len(torch_flagos.get_registered_ops())}")
 # Create tensors on flagos device
 # Note: randn uses CPU fallback, then copy to flagos
 print("\n--- Creating tensors ---")
-x = torch.randn(100, 100, device="flagos")
-y = torch.randn(100, 100, device="flagos")
+x = torch.randn(2048, 2048, device="flagos")
+y = torch.randn(2048, 2048, device="flagos")
 print(f"x shape: {x.shape}, device: {x.device}")
 print(f"y shape: {y.shape}, device: {y.device}")
 
@@ -47,3 +47,23 @@ with torch_flagos.flagos.device(0):
 print("\n" + "=" * 60)
 print("All tests passed!")
 print("=" * 60)
+
+# Check if FlagGems is available
+print(f"{torch_flagos.is_flaggems_available()=}")
+
+# Check if FlagGems operators are registered
+print(f"{torch_flagos.is_flaggems_enabled()=}")
+
+# Get list of registered operator names
+registered_ops = torch_flagos.get_registered_ops()
+print(f"Registered FlagGems ops: {len(registered_ops)}")
+print(f"Registered ops: {registered_ops}")
+
+# Device module (torch_flagos.flagos)
+print(f"Flagos device available: {torch_flagos.flagos.is_available()}")
+print(f"Flagos device count: {torch_flagos.flagos.device_count()}")
+print(f"Current device before set_device: {torch_flagos.flagos.current_device()}")
+torch_flagos.flagos.set_device(1)
+print(f"Current device after set_device: {torch_flagos.flagos.current_device()}")
+
+
