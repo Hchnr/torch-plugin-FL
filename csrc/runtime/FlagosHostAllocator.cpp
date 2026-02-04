@@ -37,4 +37,8 @@ static FlagosHostAllocator flagos_host_alloc;
 
 } // namespace
 
+c10::Allocator* getFlagosHostAllocator() {
+  return &flagos_host_alloc;
+}
+
 } // namespace c10::flagos

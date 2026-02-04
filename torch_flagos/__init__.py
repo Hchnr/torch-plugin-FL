@@ -139,6 +139,11 @@ def _register_flaggems_operators():
             # Wrap the implementation to handle flagos device context
             wrapped_func = _make_flagos_wrapper(impl_func)
             _flaggems_lib.impl(op_name, wrapped_func, "PrivateUse1")
+            # Also register for AutogradPrivateUse1 to support autograd
+            try:
+                _flaggems_lib.impl(op_name, wrapped_func, "AutogradPrivateUse1")
+            except Exception:
+                pass  # May already be registered or not needed
             _registered_ops.append(op_name)
         except Exception:
             # Some operators may already be registered or have incompatible signatures

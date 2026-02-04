@@ -78,6 +78,14 @@ def _lazy_init():
 from .random import *  # noqa: F403
 
 
+def get_amp_supported_dtype():
+    """Return list of supported dtypes for AMP (Automatic Mixed Precision).
+
+    Required by torch.autocast for custom device backends.
+    """
+    return [torch.float16, torch.bfloat16]
+
+
 __all__ = [
     "device",
     "device_count",
@@ -93,4 +101,5 @@ __all__ = [
     "manual_seed_all",
     "get_rng_state",
     "set_rng_state",
+    "get_amp_supported_dtype",
 ]

@@ -28,8 +28,20 @@ set(CMAKE_INSTALL_LIBDIR lib)
 set(CMAKE_INSTALL_MESSAGE NEVER)
 
 set(Torch_DIR ${PYTORCH_INSTALL_DIR}/share/cmake/Torch)
-find_package(Torch REQUIRED)
+
+# Workaround for CUDA 12.x where nvToolsExt is header-only (no separate library)
+# PyTorch's CMake expects CUDA::nvToolsExt target which doesn't exist in CUDA 12.x
 find_package(CUDAToolkit REQUIRED)
+if(NOT TARGET CUDA::nvToolsExt)
+  # Create a dummy IMPORTED target for nvToolsExt (NVTX3 is header-only in CUDA 12.x)
+  add_library(CUDA::nvToolsExt INTERFACE IMPORTED)
+  if(TARGET CUDA::nvtx3)
+    set_target_properties(CUDA::nvToolsExt PROPERTIES
+      INTERFACE_LINK_LIBRARIES CUDA::nvtx3)
+  endif()
+endif()
+
+find_package(Torch REQUIRED)
 
 if(DEFINED PYTHON_INCLUDE_DIR)
   include_directories(${PYTHON_INCLUDE_DIR})

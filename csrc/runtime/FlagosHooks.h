@@ -9,6 +9,7 @@
 #include <third_party/flagos/include/flagos.h>
 
 #include "FlagosGenerator.h"
+#include "FlagosHostAllocator.h"
 
 namespace c10::flagos {
 
@@ -21,7 +22,7 @@ struct FlagosHooksInterface : public at::PrivateUse1HooksInterface {
   }
 
   at::Allocator* getPinnedMemoryAllocator() const override {
-    return at::getHostAllocator(at::kPrivateUse1);
+    return getFlagosHostAllocator();
   }
 
   bool isPinnedPtr(const void* data) const override {
