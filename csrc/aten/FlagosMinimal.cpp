@@ -131,4 +131,11 @@ TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
       torch::CppFunction::makeFromBoxedFunction<&wrapper_cpu_fallback>());
 }
 
+// Register AutogradPrivateUse1 fallback to enable autograd support
+// This allows gradient computation to work with flagos device
+TORCH_LIBRARY_IMPL(_, AutogradPrivateUse1, m) {
+  m.fallback(
+      torch::CppFunction::makeFromBoxedFunction<&wrapper_cpu_fallback>());
+}
+
 } // namespace at::flagos
