@@ -99,6 +99,29 @@ at::Tensor wrapper_view(const at::Tensor& self, c10::SymIntArrayRef size) {
   return at::native::flagos::view(self, size);
 }
 
+at::Tensor wrapper_contiguous(
+    const at::Tensor& self,
+    c10::MemoryFormat memory_format) {
+  return at::native::flagos::contiguous(self, memory_format);
+}
+
+at::Tensor wrapper_clone(
+    const at::Tensor& self,
+    std::optional<c10::MemoryFormat> memory_format) {
+  return at::native::flagos::clone(self, memory_format);
+}
+
+at::Tensor wrapper__to_copy(
+    const at::Tensor& self,
+    std::optional<c10::ScalarType> dtype,
+    std::optional<c10::Layout> layout,
+    std::optional<c10::Device> device,
+    std::optional<bool> pin_memory,
+    bool non_blocking,
+    std::optional<c10::MemoryFormat> memory_format) {
+  return at::native::flagos::_to_copy(self, dtype, layout, device, pin_memory, non_blocking, memory_format);
+}
+
 void wrapper_cpu_fallback(
     const c10::OperatorHandle& op,
     torch::jit::Stack* stack) {
@@ -123,6 +146,9 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
       "set_.source_Storage_storage_offset",
       wrapper_set_source_Storage_storage_offsetset_);
   m.impl("view", wrapper_view);
+  m.impl("contiguous", wrapper_contiguous);
+  m.impl("clone", wrapper_clone);
+  m.impl("_to_copy", wrapper__to_copy);
 }
 
 // Register fallback for all unimplemented operators

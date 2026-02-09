@@ -17,6 +17,13 @@ struct FlagosHooksInterface : public at::PrivateUse1HooksInterface {
   FlagosHooksInterface() {};
   ~FlagosHooksInterface() override = default;
 
+  // Required by dist.barrier() and other distributed operations
+  bool isAvailable() const override {
+    int count = 0;
+    foGetDeviceCount(&count);
+    return count > 0;
+  }
+
   bool hasPrimaryContext(c10::DeviceIndex device_index) const override {
     return true;
   }

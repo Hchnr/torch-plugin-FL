@@ -64,6 +64,23 @@ at::Tensor& set_source_Storage_storage_offset_(
 
 at::Tensor view(const at::Tensor& self, c10::SymIntArrayRef size);
 
+at::Tensor contiguous(
+    const at::Tensor& self,
+    c10::MemoryFormat memory_format);
+
+at::Tensor clone(
+    const at::Tensor& self,
+    std::optional<c10::MemoryFormat> memory_format);
+
+at::Tensor _to_copy(
+    const at::Tensor& self,
+    std::optional<c10::ScalarType> dtype,
+    std::optional<c10::Layout> layout,
+    std::optional<c10::Device> device,
+    std::optional<bool> pin_memory,
+    bool non_blocking,
+    std::optional<c10::MemoryFormat> memory_format);
+
 void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack);
 
 } // namespace at::native::flagos
