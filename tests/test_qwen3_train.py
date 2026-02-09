@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader, Dataset
 model_name = "/nfs/hcr/models/Qwen/Qwen3-0.6B"
 DEVICE = "flagos:0"
 BATCH_SIZE = 2
-MAX_SEQ_LEN = 256
+MAX_SEQ_LEN = 1024
 NUM_TRAIN_STEPS = 10
 LEARNING_RATE = 1e-5
 GRADIENT_ACCUMULATION_STEPS = 1

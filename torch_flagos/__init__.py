@@ -68,54 +68,140 @@ _EXCLUDED_OPS = {
     # Random ops that use device context
     "uniform_", "normal.float_Tensor", "normal.Tensor_float", "normal.Tensor_tensor",
     "exponential_", "multinomial",
+    # Copy ops - exclude to prevent recursion in _flagos_to_cuda
+    # These will use the C++ cpu_fallback which handles flagos correctly
+    "copy_", "_to_copy", "contiguous", "clone",
 }
 
 
 def _get_device_index(args, kwargs):
     """Extract flagos device index from arguments."""
     for arg in args:
-        if isinstance(arg, torch.Tensor) and arg.device.type == "privateuseone":
+        if isinstance(arg, torch.Tensor) and arg.device.type in ("privateuseone", "flagos"):
             return arg.device.index or 0
     for v in kwargs.values():
-        if isinstance(v, torch.Tensor) and v.device.type == "privateuseone":
+        if isinstance(v, torch.Tensor) and v.device.type in ("privateuseone", "flagos"):
             return v.device.index or 0
     return 0
 
 
+# Cache for CUDA runtime library
+_cudart_lib = None
+_cudaMemcpy = None
+
+
+def _get_cudaMemcpy():
+    """Get cudaMemcpy function from CUDA runtime library (cached)."""
+    global _cudart_lib, _cudaMemcpy
+    if _cudaMemcpy is not None:
+        return _cudaMemcpy
+
+    import ctypes
+    import os
+
+    # Try to load CUDA runtime library
+    try:
+        _cudart_lib = ctypes.CDLL("libcudart.so")
+    except OSError:
+        cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
+        _cudart_lib = ctypes.CDLL(f"{cuda_home}/lib64/libcudart.so")
+
+    _cudaMemcpy = _cudart_lib.cudaMemcpy
+    _cudaMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    _cudaMemcpy.restype = ctypes.c_int
+
+    return _cudaMemcpy
+
+
+# Thread-local set to track tensor IDs currently being converted (to prevent infinite recursion)
+import threading
+_converting_tensor_ids = threading.local()
+
+
 def _flagos_to_cuda(t, device_index):
     """
-    Convert a flagos tensor to a CUDA tensor view sharing the same storage.
-    This preserves the requires_grad attribute for autograd.
+    Convert a flagos tensor to a CUDA tensor.
+    Since flagos and CUDA share the same underlying GPU memory, we create
+    a CUDA tensor and copy data using cudaMemcpy.
     """
     if not isinstance(t, torch.Tensor):
         return t
-    if t.device.type != "privateuseone":
+    if t.device.type not in ("privateuseone", "flagos"):
         return t
 
-    # Create a CUDA tensor that shares storage with the flagos tensor
-    # Use view_as to maintain autograd tracking
-    cuda_t = torch.empty(0, device=f"cuda:{device_index}", dtype=t.dtype)
-    cuda_t.set_(t.untyped_storage(), t.storage_offset(), t.shape, t.stride())
+    # Get the set of tensor IDs being converted (thread-local)
+    if not hasattr(_converting_tensor_ids, 'ids'):
+        _converting_tensor_ids.ids = set()
 
-    if t.requires_grad:
-        cuda_t.requires_grad_(True)
+    # Check if this specific tensor is already being converted (recursion)
+    tensor_id = id(t)
+    if tensor_id in _converting_tensor_ids.ids:
+        # We're already converting this tensor, skip to prevent infinite recursion
+        return t
 
-    return cuda_t
+    # Use the tensor's own device index to ensure correct device mapping
+    actual_device_index = t.device.index if t.device.index is not None else device_index
+
+    try:
+        _converting_tensor_ids.ids.add(tensor_id)
+
+        # Use _to_copy (implemented in C++) to handle the conversion
+        # This properly handles non-contiguous tensors and cross-device copies
+        cuda_t = t.to(f"cuda:{actual_device_index}")
+
+        if t.requires_grad and not cuda_t.requires_grad:
+            cuda_t.requires_grad_(True)
+
+        return cuda_t
+    finally:
+        _converting_tensor_ids.ids.discard(tensor_id)
+
+
+class _CudaToFlagosFunction(torch.autograd.Function):
+    """
+    Autograd function to convert CUDA tensor to flagos tensor while preserving gradients.
+    Uses _to_copy (C++ implementation) for the actual copy.
+    """
+    @staticmethod
+    def forward(ctx, cuda_tensor, device_index):
+        import os
+        rank = os.environ.get("RANK", "?")
+        print(f"[DEBUG rank{rank}] _CudaToFlagosFunction.forward: input device={cuda_tensor.device}, shape={cuda_tensor.shape}", flush=True)
+        ctx.device_index = device_index
+        ctx.cuda_device = cuda_tensor.device
+        # Use detach and _to_copy to avoid autograd issues during conversion
+        # The autograd graph is maintained by this Function, not by the underlying copy
+        with torch.no_grad():
+            print(f"[DEBUG rank{rank}] calling .to(flagos:{device_index})", flush=True)
+            flagos_t = cuda_tensor.to(f"flagos:{device_index}")
+            print(f"[DEBUG rank{rank}] .to() completed: output device={flagos_t.device}", flush=True)
+        return flagos_t
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Convert flagos gradient back to CUDA for backward pass
+        if grad_output is None:
+            return None, None
+        # grad_output is on flagos, convert to CUDA
+        cuda_grad = grad_output.to(ctx.cuda_device)
+        return cuda_grad, None
 
 
 def _cuda_to_flagos(t, device_index):
     """
-    Convert a CUDA tensor to a flagos tensor view sharing the same storage.
+    Convert a CUDA tensor to a flagos tensor.
+    Preserves autograd graph using custom autograd function.
     """
     if not isinstance(t, torch.Tensor):
         return t
     if t.device.type != "cuda":
         return t
 
-    flagos_t = torch.empty(0, device=f"flagos:{device_index}", dtype=t.dtype)
-    flagos_t.set_(t.untyped_storage(), t.storage_offset(), t.shape, t.stride())
-
-    return flagos_t
+    if t.requires_grad:
+        return _CudaToFlagosFunction.apply(t, device_index)
+    else:
+        # For non-grad tensors, use direct copy via _to_copy (C++ implementation)
+        return t.to(f"flagos:{device_index}")
 
 
 def _make_autograd_function(op_name, forward_func, backward_func=None):
@@ -140,7 +226,7 @@ def _make_autograd_function(op_name, forward_func, backward_func=None):
             # Get device index
             device_index = 0
             for arg in args:
-                if isinstance(arg, torch.Tensor) and arg.device.type == "privateuseone":
+                if isinstance(arg, torch.Tensor) and arg.device.type in ("privateuseone", "flagos"):
                     device_index = arg.device.index or 0
                     break
 
@@ -197,18 +283,48 @@ def _make_simple_wrapper(impl_func):
     def wrapper(*args, **kwargs):
         device_index = _get_device_index(args, kwargs)
 
-        # Convert flagos tensors to CUDA views (shares storage)
+        # Convert flagos tensors to CUDA
         cuda_args = [_flagos_to_cuda(arg, device_index) for arg in args]
         cuda_kwargs = {k: _flagos_to_cuda(v, device_index) for k, v in kwargs.items()}
 
+        # Debug: Check converted tensors for embedding (temporary)
+        if impl_func.__name__ == "embedding":
+            import os
+            rank = os.environ.get("RANK", "?")
+            print(f"[DEBUG rank{rank}] embedding: device_index={device_index}", flush=True)
+            for i, (orig, cuda) in enumerate(zip(args, cuda_args)):
+                if isinstance(orig, torch.Tensor):
+                    print(f"[DEBUG rank{rank}]   arg[{i}]: {orig.device} -> {cuda.device}", flush=True)
+
         # Run with CUDA device context
-        # Result will be CUDA tensor with proper autograd support
         with torch.cuda.device(device_index):
             result = impl_func(*cuda_args, **cuda_kwargs)
 
-        # DO NOT convert back to flagos - this preserves autograd graph
-        # The result will be CUDA tensor(s), which have proper grad_fn
-        return result
+        # Debug: print result info before conversion
+        if impl_func.__name__ == "embedding":
+            import os
+            rank = os.environ.get("RANK", "?")
+            if isinstance(result, torch.Tensor):
+                print(f"[DEBUG rank{rank}] embedding result: device={result.device}, shape={result.shape}, requires_grad={result.requires_grad}", flush=True)
+
+        # Convert result back to flagos device
+        # This preserves autograd graph using _CudaToFlagosFunction
+        def convert_result(r, depth=0):
+            if isinstance(r, torch.Tensor) and r.device.type == "cuda":
+                if impl_func.__name__ == "embedding":
+                    import os
+                    rank = os.environ.get("RANK", "?")
+                    print(f"[DEBUG rank{rank}] converting tensor: device={r.device}, shape={r.shape}, requires_grad={r.requires_grad}", flush=True)
+                converted = _cuda_to_flagos(r, device_index)
+                if impl_func.__name__ == "embedding":
+                    print(f"[DEBUG rank{rank}] converted to: device={converted.device}", flush=True)
+                return converted
+            elif isinstance(r, (tuple, list)):
+                return type(r)(convert_result(x, depth+1) for x in r)
+            else:
+                return r
+
+        return convert_result(result)
 
     return wrapper
 
