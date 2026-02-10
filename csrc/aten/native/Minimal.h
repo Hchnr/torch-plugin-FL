@@ -83,4 +83,9 @@ at::Tensor _to_copy(
 
 void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack);
 
+// Zero-copy view conversion functions between flagos and CUDA
+// These share the same underlying GPU memory without copying
+at::Tensor flagos_to_cuda_view(const at::Tensor& self);
+at::Tensor cuda_to_flagos_view(const at::Tensor& self, int device_index = -1);
+
 } // namespace at::native::flagos

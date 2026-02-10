@@ -412,4 +412,79 @@ void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   at::native::cpu_fallback(op, stack);
 }
 
+at::Tensor flagos_to_cuda_view(const at::Tensor& self) {
+  // Create a CUDA tensor view that shares the same GPU memory as the flagos tensor.
+  // Since flagos uses cudaMalloc for allocation, the memory is accessible to CUDA.
+  TORCH_CHECK(self.is_privateuseone(), "Expected flagos tensor, got ", self.device());
+
+  int device_index = self.device().index();
+  if (device_index < 0) device_index = 0;
+
+  // Make contiguous if needed
+  at::Tensor src = self.is_contiguous() ? self : self.contiguous();
+
+  // Create CUDA storage sharing the same data pointer
+  // We use the same allocator-free approach: create storage from raw pointer
+  auto data_ptr = src.data_ptr();
+  auto nbytes = src.numel() * src.element_size();
+
+  // Create a CUDA storage that wraps the existing memory (no ownership)
+  auto storage = c10::Storage(
+      c10::Storage::use_byte_size_t(),
+      nbytes,
+      c10::DataPtr(
+          data_ptr,
+          data_ptr,
+          [](void*) {},  // No-op deleter since we don't own the memory
+          c10::Device(c10::kCUDA, device_index)
+      ),
+      nullptr,  // No allocator
+      false     // Not resizable
+  );
+
+  // Create CUDA tensor with the shared storage
+  auto cuda_tensor = at::empty({0}, src.options().device(c10::Device(c10::kCUDA, device_index)));
+  cuda_tensor.set_(storage, 0, src.sizes(), src.strides());
+
+  return cuda_tensor;
+}
+
+at::Tensor cuda_to_flagos_view(const at::Tensor& self, int device_index) {
+  // Create a flagos tensor view that shares the same GPU memory as the CUDA tensor.
+  // Since both use the same GPU memory, this is a zero-copy operation.
+  TORCH_CHECK(self.is_cuda(), "Expected CUDA tensor, got ", self.device());
+
+  if (device_index < 0) {
+    device_index = self.device().index();
+    if (device_index < 0) device_index = 0;
+  }
+
+  // Make contiguous if needed
+  at::Tensor src = self.is_contiguous() ? self : self.contiguous();
+
+  // Create flagos storage sharing the same data pointer
+  auto data_ptr = src.data_ptr();
+  auto nbytes = src.numel() * src.element_size();
+
+  // Create a flagos storage that wraps the existing memory (no ownership)
+  auto storage = c10::Storage(
+      c10::Storage::use_byte_size_t(),
+      nbytes,
+      c10::DataPtr(
+          data_ptr,
+          data_ptr,
+          [](void*) {},  // No-op deleter since we don't own the memory
+          c10::Device(c10::kPrivateUse1, device_index)
+      ),
+      nullptr,  // No allocator
+      false     // Not resizable
+  );
+
+  // Create flagos tensor with the shared storage
+  auto flagos_tensor = at::empty({0}, src.options().device(c10::Device(c10::kPrivateUse1, device_index)));
+  flagos_tensor.set_(storage, 0, src.sizes(), src.strides());
+
+  return flagos_tensor;
+}
+
 } // namespace at::native::flagos
