@@ -150,8 +150,8 @@ def main():
 
     # Configuration parameters
     model_name = "/nfs/hcr/models/Qwen/Qwen3-0.6B"
-    BATCH_SIZE = 2
-    MAX_SEQ_LEN = 1024
+    BATCH_SIZE = 1
+    MAX_SEQ_LEN = 256
     NUM_TRAIN_STEPS = 10
     LEARNING_RATE = 1e-5
     GRADIENT_ACCUMULATION_STEPS = 1

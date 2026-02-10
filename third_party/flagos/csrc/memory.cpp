@@ -4,6 +4,7 @@
 #include <map>
 #include <mutex>
 #include <cstring>
+#include <cstdio>
 
 namespace {
 
@@ -32,9 +33,21 @@ class MemoryManager {
     if (type == foMemoryType::foMemoryTypeDevice) {
       foGetDevice(&current_device);
 
-      cudaError_t err = cudaMalloc(&mem, size);
-      if (err != cudaSuccess || mem == nullptr)
+      // Ensure CUDA device is set correctly before allocation
+      // This is critical in multi-process environments like DDP
+      cudaError_t set_err = cudaSetDevice(current_device);
+      if (set_err != cudaSuccess) {
+        fprintf(stderr, "[flagos] cudaSetDevice(%d) failed: %s\n",
+                current_device, cudaGetErrorString(set_err));
         return foErrorMemoryAllocation;
+      }
+
+      cudaError_t err = cudaMalloc(&mem, size);
+      if (err != cudaSuccess || mem == nullptr) {
+        fprintf(stderr, "[flagos] cudaMalloc(%zu bytes) on device %d failed: %s\n",
+                size, current_device, cudaGetErrorString(err));
+        return foErrorMemoryAllocation;
+      }
     } else {
       cudaError_t err = cudaMallocHost(&mem, size);
       if (err != cudaSuccess || mem == nullptr)
