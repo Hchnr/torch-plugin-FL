@@ -57,6 +57,36 @@ def main():
     for param in model.parameters():
         param.requires_grad = True
 
+    # Pre-warmup: Detect and freeze unused parameters.
+    # This is necessary because some parameters (e.g. in rotary embeddings) may not
+    # receive gradients during training. Freezing them avoids errors during backward pass.
+    print("\n[1.5] Detecting and freezing unused parameters...")
+
+    # Do a forward + backward pass to detect which parameters don't receive gradients
+    dummy_input = torch.randint(0, 1000, (1, 32), device=DEVICE)
+    with torch.enable_grad():
+        dummy_output = model(input_ids=dummy_input, attention_mask=None, labels=None, use_cache=False)
+        dummy_loss = dummy_output.logits.sum()
+        dummy_loss.backward()
+
+    # Find and freeze parameters that didn't receive gradients
+    unused_params = []
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            param.requires_grad = False
+            unused_params.append(name)
+        else:
+            param.grad = None  # Clear gradient for actual training
+
+    print(f"    Frozen {len(unused_params)} unused parameters")
+    if unused_params:
+        for name in unused_params[:5]:
+            print(f"      - {name}")
+        if len(unused_params) > 5:
+            print(f"      ... and {len(unused_params) - 5} more")
+
+    sync()
+
     print(f"Model device: {next(model.parameters()).device}")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}M")
