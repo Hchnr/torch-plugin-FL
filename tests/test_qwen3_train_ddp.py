@@ -3,17 +3,62 @@ Qwen3 DDP (Distributed Data Parallel) Training Test - Using torch_flagos
 
 Usage:
     torchrun --nproc_per_node=2 test_qwen3_train_ddp.py
-
-    or with more GPUs:
-    torchrun --nproc_per_node=4 test_qwen3_train_ddp.py
 """
 
 import os
-import torch
-import torch.distributed as dist
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
-import torch_flagos  # Automatically registers FlagGems operators to flagos device
+import functools
 import time
+
+import torch
+import torch._dynamo.utils
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
+import torch_flagos  # Automatically registers FlagGems operators to flagos device
+from dummy_dataset import DummyTextDataset
+
+
+def _patch_dist_collectives():
+    """Patch torch.distributed collectives to transparently handle flagos tensors.
+
+    After patching, dist.all_reduce(flagos_tensor) works directly without
+    any manual _flagos_to_cuda_view conversion in user code.
+    """
+    import torch_flagos._C as _C
+
+    def _ensure_cuda(tensor):
+        if tensor.device.type in ("privateuseone", "flagos"):
+            return _C._flagos_to_cuda_view(tensor)
+        return tensor
+
+    _orig_all_reduce = dist.all_reduce
+    def _all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
+        return _orig_all_reduce(_ensure_cuda(tensor), op=op, group=group, async_op=async_op)
+    dist.all_reduce = _all_reduce
+
+    _orig_broadcast = dist.broadcast
+    def _broadcast(tensor, src, group=None, async_op=False):
+        return _orig_broadcast(_ensure_cuda(tensor), src=src, group=group, async_op=async_op)
+    dist.broadcast = _broadcast
+
+    _orig_reduce = dist.reduce
+    def _reduce(tensor, dst, op=dist.ReduceOp.SUM, group=None, async_op=False):
+        return _orig_reduce(_ensure_cuda(tensor), dst=dst, op=op, group=group, async_op=async_op)
+    dist.reduce = _reduce
+
+    _orig_all_gather_into_tensor = dist.all_gather_into_tensor
+    def _all_gather_into_tensor(output, input, group=None, async_op=False):
+        return _orig_all_gather_into_tensor(
+            _ensure_cuda(output), _ensure_cuda(input), group=group, async_op=async_op,
+        )
+    dist.all_gather_into_tensor = _all_gather_into_tensor
+
+    _orig_reduce_scatter_tensor = dist.reduce_scatter_tensor
+    def _reduce_scatter_tensor(output, input, op=dist.ReduceOp.SUM, group=None, async_op=False):
+        return _orig_reduce_scatter_tensor(
+            _ensure_cuda(output), _ensure_cuda(input), op=op, group=group, async_op=async_op,
+        )
+    dist.reduce_scatter_tensor = _reduce_scatter_tensor
 
 
 def setup_distributed():
@@ -56,6 +101,9 @@ def setup_distributed():
         except Exception as e:
             print(f"[DEBUG] Failed to get PrivateUse1 backend: {e}", flush=True)
 
+    # Patch dist collectives to transparently handle flagos tensors
+    _patch_dist_collectives()
+
     world_size = dist.get_world_size()
     rank = dist.get_rank()
 
@@ -79,53 +127,11 @@ def sync():
 
 
 def dist_barrier(local_rank):
-    """Barrier using all_reduce on CUDA device (flagos shares storage with CUDA)"""
+    """Barrier using all_reduce on flagos device"""
     sync()
-    # Use CUDA tensor for NCCL communication (flagos and CUDA share the same storage)
-    t = torch.zeros(1, device=f"cuda:{local_rank}")
+    t = torch.zeros(1, device=f"flagos:{local_rank}")
     dist.all_reduce(t)
     sync()
-
-
-class DummyTextDataset(Dataset):
-    """Simple dummy text dataset for testing training workflow"""
-    def __init__(self, tokenizer, num_samples=100, max_length=256):
-        self.tokenizer = tokenizer
-        self.num_samples = num_samples
-        self.max_length = max_length
-
-        # Generate some simple training samples
-        self.texts = [
-            "Large language models are neural networks trained on vast amounts of text data.",
-            "Machine learning is a subset of artificial intelligence.",
-            "Natural language processing enables computers to understand human language.",
-            "Deep learning uses multiple layers of neural networks.",
-            "Transformers revolutionized the field of natural language processing.",
-            "Attention mechanisms allow models to focus on relevant parts of the input.",
-            "Fine-tuning adapts pre-trained models to specific tasks.",
-            "Gradient descent is used to optimize neural network parameters.",
-            "Backpropagation computes gradients for training neural networks.",
-            "The loss function measures how well the model performs.",
-        ] * (num_samples // 10 + 1)
-        self.texts = self.texts[:num_samples]
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, idx):
-        text = self.texts[idx % len(self.texts)]
-        encodings = self.tokenizer(
-            text,
-            truncation=True,
-            max_length=self.max_length,
-            padding="max_length",
-            return_tensors="pt"
-        )
-        return {
-            "input_ids": encodings["input_ids"].squeeze(0),
-            "attention_mask": encodings["attention_mask"].squeeze(0),
-            "labels": encodings["input_ids"].squeeze(0)  # Autoregressive LM training
-        }
 
 
 def main():
@@ -259,30 +265,51 @@ def main():
         if cpu_buffers:
             print(f"    CPU buffers (first 5): {cpu_buffers[:5]}")
 
-    # Note: We do NOT use DDP because PyTorch's DDP Reducer (C++ code) validates
-    # that all parameter data pointers are on "cuda" device type. For custom devices
-    # like flagos (privateuseone), this check fails before the comm_hook is even called.
-    # Instead, we manually synchronize gradients after backward using NCCL allreduce
-    # with flagos-to-CUDA view conversion.
-    import torch_flagos._C as _C
+    # Wrap model with DDP using a monkey-patched "python_reducer" mode.
+    #
+    # Problem: PyTorch's C++ Reducer installs autograd hooks that use CUDA Future
+    # mechanism, which calls ivalue::Future::markCompleted() → getDevicesOfStorages().
+    # This validates all tensor storage devices match "cuda", failing for flagos
+    # (privateuseone) tensors with:
+    #   "Expected all data ptrs to be on a device of type cuda, got one on device flagos:0"
+    #
+    # Solution: Force _use_python_reducer=True so the C++ Reducer does NOT install
+    # autograd hooks. Then register our own Python-based post_accumulate_grad hooks
+    # that call the patched dist.all_reduce (which transparently handles flagos tensors).
+    _orig_get_ddp_mode = torch._dynamo.utils.get_optimize_ddp_mode
+    torch._dynamo.utils.get_optimize_ddp_mode = lambda: "python_reducer"
+    try:
+        print(f"[rank{rank}] Before DDP init: model device={next(model.parameters()).device}, "
+              f"CUDA current device={torch.cuda.current_device()}", flush=True)
+        model = DDP(model, init_sync=False, broadcast_buffers=False, gradient_as_bucket_view=True)
+        print(f"[rank{rank}] After DDP init successful", flush=True)
+    finally:
+        torch._dynamo.utils.get_optimize_ddp_mode = _orig_get_ddp_mode
 
-    def sync_gradients(model, world_size):
-        """Manually allreduce gradients across all ranks using NCCL.
+    # Replace default accum_grad_hooks (which use fcol.all_reduce that doesn't
+    # go through our patched dist collectives) with our version.
+    for h in model._accum_grad_hooks:
+        h.remove()
+    model._accum_grad_hooks.clear()
 
-        Converts flagos tensors to CUDA views for NCCL compatibility,
-        since flagos and CUDA share the same underlying storage.
-        """
-        for param in model.parameters():
-            if param.grad is not None:
-                grad = param.grad
-                if grad.device.type in ("privateuseone", "flagos"):
-                    cuda_grad = _C._flagos_to_cuda_view(grad)
-                    dist.all_reduce(cuda_grad, op=dist.ReduceOp.SUM)
-                else:
-                    dist.all_reduce(grad, op=dist.ReduceOp.SUM)
-                param.grad.div_(world_size)
+    def flagos_accum_grad_hook(param, *, ddp_model):
+        if not ddp_model.require_backward_grad_sync:
+            return
+        if param.grad is None:
+            return
+        # dist.all_reduce is patched by _patch_dist_collectives() to
+        # transparently handle flagos tensors (no manual conversion needed)
+        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+        param.grad.div_(dist.get_world_size())
 
-    print_rank0("    Using manual gradient sync (no DDP)", rank)
+    for param in model._module_parameters:
+        if param.requires_grad:
+            model._accum_grad_hooks.append(
+                param.register_post_accumulate_grad_hook(
+                    functools.partial(flagos_accum_grad_hook, ddp_model=model)
+                )
+            )
+    print_rank0("    Registered flagos DDP with python_reducer + custom grad hooks", rank)
 
     print_rank0(f"Model device: {next(model.parameters()).device}", rank)
     print_rank0(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M", rank)
@@ -377,10 +404,8 @@ def main():
             print(f"    [DEBUG] loss.requires_grad: {loss.requires_grad}")
 
         # Backward pass
+        # Gradient sync happens automatically via post_accumulate_grad hooks
         loss.backward()
-
-        # Manually sync gradients across ranks (replacing DDP's automatic sync)
-        sync_gradients(model, world_size)
 
         # Gradient accumulation
         if (step + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
