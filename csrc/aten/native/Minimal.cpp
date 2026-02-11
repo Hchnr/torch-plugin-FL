@@ -256,7 +256,6 @@ at::Tensor clone(
   auto memory_format = memory_format_opt.value_or(c10::MemoryFormat::Preserve);
 
   if (memory_format == c10::MemoryFormat::Preserve) {
-    // Clone with same memory layout
     if (self.is_contiguous()) {
       auto result = at::empty_like(self);
       size_t nbytes = self.numel() * self.element_size();
@@ -266,13 +265,18 @@ at::Tensor clone(
         result.copy_(self);
       }
       return result;
-    } else {
-      // For non-contiguous, make contiguous clone
-      return contiguous(self, c10::MemoryFormat::Contiguous);
     }
+    // For non-contiguous with Preserve, fall through to create contiguous copy
+    memory_format = c10::MemoryFormat::Contiguous;
   }
 
-  return contiguous(self, memory_format);
+  // Create a contiguous result tensor and copy data into it.
+  // NOTE: Do NOT call contiguous() here to avoid infinite recursion when
+  // contiguous is unregistered from PrivateUse1 (CompositeImplicitAutograd
+  // contiguous calls clone, which would call contiguous again).
+  auto result = at::empty(self.sizes(), self.options().memory_format(memory_format));
+  result.copy_(self);
+  return result;
 }
 
 at::Tensor _to_copy(

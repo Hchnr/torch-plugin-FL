@@ -284,6 +284,43 @@ def _register_flaggems_operators():
     return len(_registered_ops)
 
 
+def _register_composite_ops():
+    """
+    Register CompositeExplicitAutograd ops that cause cpu_fallback segfault.
+
+    Some PyTorch ops are CompositeExplicitAutograd (not CompositeImplicitAutograd),
+    meaning they don't auto-decompose for PrivateUse1. They fall through to
+    cpu_fallback which segfaults when handling privateuseone tensors.
+
+    We register these manually by implementing them in terms of ops that are
+    already registered (like slice_scatter).
+    """
+    lib = torch.library.Library("aten", "IMPL")
+
+    # slice_backward: used by autograd for tensor slicing (x[..., :n])
+    # Implementation mirrors PyTorch's native slice_backward which calls slice_scatter
+    def slice_backward_impl(grad_output, input_sizes, dim, start, end, step):
+        # Convert SymInt to int for compatibility
+        input_sizes = [int(s) for s in input_sizes]
+        dim = int(dim)
+        start = int(start)
+        end = int(end)
+        step = int(step)
+        # Clamp end to input_sizes[dim] (PyTorch passes large values like sys.maxsize)
+        if end > input_sizes[dim]:
+            end = input_sizes[dim]
+        grad_input = torch.zeros(input_sizes, dtype=grad_output.dtype, device=grad_output.device)
+        return torch.slice_scatter(grad_input, grad_output, dim, start, end, step)
+
+    lib.impl("slice_backward", slice_backward_impl, "PrivateUse1")
+
+    return lib  # prevent GC
+
+
+# Hold reference to prevent garbage collection of the library
+_composite_ops_lib = None
+
+
 def get_registered_ops():
     """Return list of registered FlagGems operators for flagos device."""
     return list(_registered_ops)
@@ -296,6 +333,7 @@ def is_flaggems_enabled():
 
 # Auto-register FlagGems operators on import
 _register_flaggems_operators()
+_composite_ops_lib = _register_composite_ops()
 
 
 # Re-export integration utilities

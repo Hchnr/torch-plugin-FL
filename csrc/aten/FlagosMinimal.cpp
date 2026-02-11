@@ -163,4 +163,30 @@ TORCH_LIBRARY_IMPL(_, AutogradPrivateUse1, m) {
   m.fallback(torch::CppFunction::makeFallthrough());
 }
 
+// Register autograd-aware contiguous for PrivateUse1 tensors.
+//
+// Problem: contiguous registered on PrivateUse1 bypasses autograd recording
+// (AutogradPrivateUse1 is fallthrough), causing grad_fn=None on the output
+// and breaking gradient propagation (e.g., in attention layers that use
+// transpose().contiguous()). On CUDA, contiguous() returns a tensor with
+// CloneBackward0 grad_fn; on flagos it returned grad_fn=None.
+//
+// Solution: Register contiguous on AutogradPrivateUse1 so it intercepts
+// the call before fallthrough. When the tensor actually needs copying
+// (is non-contiguous), we use clone(memory_format) which properly records
+// autograd operations. clone dispatches to PrivateUse1::clone which
+// handles the actual data copy.
+TORCH_LIBRARY_IMPL(aten, AutogradPrivateUse1, m) {
+  m.impl("contiguous", [](const at::Tensor& self, c10::MemoryFormat memory_format) -> at::Tensor {
+    if (self.is_contiguous(memory_format)) {
+      return self;
+    }
+    // clone(memory_format) creates a contiguous copy with autograd tracking.
+    // This dispatches to PrivateUse1::clone (which uses empty + copy_),
+    // and autograd records CloneBackward0 for gradient propagation.
+    return self.clone(memory_format);
+  });
+}
+
+
 } // namespace at::flagos
