@@ -11,7 +11,6 @@ Usage:
 import os
 import torch
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 import torch_flagos  # Automatically registers FlagGems operators to flagos device
 import time
@@ -191,6 +190,37 @@ def main():
     for param in model.parameters():
         param.requires_grad = True
 
+    # Pre-warmup: Detect and freeze unused parameters before DDP wrapping.
+    # This is necessary because DDP's find_unused_parameters and static_graph
+    # options don't fully work with privateuseone devices (they have CUDA-specific checks).
+    # By freezing unused parameters upfront, DDP won't try to sync their gradients.
+    print_rank0("\n[1.5] Detecting and freezing unused parameters...", rank)
+
+    # Do a forward + backward pass to detect which parameters don't receive gradients
+    dummy_input = torch.randint(0, 1000, (1, 32), device=device)
+    with torch.enable_grad():
+        dummy_output = model(input_ids=dummy_input, attention_mask=None, labels=None, use_cache=False)
+        dummy_loss = dummy_output.logits.sum()
+        dummy_loss.backward()
+
+    # Find and freeze parameters that didn't receive gradients
+    unused_params = []
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            param.requires_grad = False
+            unused_params.append(name)
+        else:
+            param.grad = None  # Clear gradient for actual training
+
+    print_rank0(f"    Frozen {len(unused_params)} unused parameters", rank)
+    if rank == 0 and unused_params:
+        for name in unused_params[:5]:
+            print(f"      - {name}")
+        if len(unused_params) > 5:
+            print(f"      ... and {len(unused_params) - 5} more")
+
+    sync()
+
     # Synchronize before DDP initialization
     dist_barrier(local_rank)
 
@@ -229,17 +259,30 @@ def main():
         if cpu_buffers:
             print(f"    CPU buffers (first 5): {cpu_buffers[:5]}")
 
-    # Wrap model with DDP
-    # Note: For custom devices like flagos, we don't use device_ids/output_device
-    # which are CUDA-specific parameters
-    # Use init_sync=False because DDP's internal verification uses distributed ops
-    # that don't fully support privateuseone device type yet
-    # Use broadcast_buffers=False because buffer sync also has the same issue
-    # Since all ranks load from the same checkpoint, params and buffers are already synchronized
-    print(f"[rank{rank}] Before DDP init: model device={next(model.parameters()).device}, "
-          f"CUDA current device={torch.cuda.current_device()}", flush=True)
-    model = DDP(model, init_sync=False, broadcast_buffers=False, gradient_as_bucket_view=True)
-    print(f"[rank{rank}] After DDP init successful", flush=True)
+    # Note: We do NOT use DDP because PyTorch's DDP Reducer (C++ code) validates
+    # that all parameter data pointers are on "cuda" device type. For custom devices
+    # like flagos (privateuseone), this check fails before the comm_hook is even called.
+    # Instead, we manually synchronize gradients after backward using NCCL allreduce
+    # with flagos-to-CUDA view conversion.
+    import torch_flagos._C as _C
+
+    def sync_gradients(model, world_size):
+        """Manually allreduce gradients across all ranks using NCCL.
+
+        Converts flagos tensors to CUDA views for NCCL compatibility,
+        since flagos and CUDA share the same underlying storage.
+        """
+        for param in model.parameters():
+            if param.grad is not None:
+                grad = param.grad
+                if grad.device.type in ("privateuseone", "flagos"):
+                    cuda_grad = _C._flagos_to_cuda_view(grad)
+                    dist.all_reduce(cuda_grad, op=dist.ReduceOp.SUM)
+                else:
+                    dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+                param.grad.div_(world_size)
+
+    print_rank0("    Using manual gradient sync (no DDP)", rank)
 
     print_rank0(f"Model device: {next(model.parameters()).device}", rank)
     print_rank0(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M", rank)
@@ -335,6 +378,9 @@ def main():
 
         # Backward pass
         loss.backward()
+
+        # Manually sync gradients across ranks (replacing DDP's automatic sync)
+        sync_gradients(model, world_size)
 
         # Gradient accumulation
         if (step + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
