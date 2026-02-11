@@ -6,6 +6,7 @@
 #include <c10/core/Allocator.h>
 #include <c10/core/Device.h>
 
+#include <cuda_runtime.h>
 #include <third_party/flagos/include/flagos.h>
 
 #include "FlagosGenerator.h"
@@ -33,10 +34,28 @@ struct FlagosHooksInterface : public at::PrivateUse1HooksInterface {
   }
 
   bool isPinnedPtr(const void* data) const override {
-    foPointerAttributes attr{};
-    foPointerGetAttributes(&attr, data);
+    // First check flagos's own registry
+    foPointerAttributes fo_attr{};
+    foPointerGetAttributes(&fo_attr, data);
+    if (fo_attr.type == foMemoryTypeHost) {
+      return true;
+    }
 
-    return attr.type == foMemoryTypeHost;
+    // Fallback: check if it's CUDA pinned memory
+    // This is needed because when CUDA is present, PyTorch's pinned memory
+    // allocator defaults to CUDA's cudaMallocHost, which won't be in flagos's
+    // registry but is still valid pinned memory for DDP operations.
+    cudaPointerAttributes cuda_attr{};
+    cudaError_t err = cudaPointerGetAttributes(&cuda_attr, data);
+    if (err == cudaSuccess && cuda_attr.type == cudaMemoryTypeHost) {
+      return true;
+    }
+    // Clear any CUDA error
+    if (err != cudaSuccess) {
+      cudaGetLastError();
+    }
+
+    return false;
   }
 
   const at::Generator& getDefaultGenerator(
