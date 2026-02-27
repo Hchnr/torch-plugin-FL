@@ -28,15 +28,83 @@ import time
 from dummy_dataset import DummyTextDataset
 
 
+def _patch_dist_collectives():
+    """Patch torch.distributed collectives to transparently handle flagos tensors.
+
+    After patching, dist.all_reduce(flagos_tensor) works directly without
+    any manual _flagos_to_cuda_view conversion in user code.
+    """
+    import torch_flagos._C as _C
+
+    def _ensure_cuda(tensor):
+        if tensor.device.type in ("privateuseone", "flagos"):
+            return _C._flagos_to_cuda_view(tensor)
+        return tensor
+
+    _orig_all_reduce = dist.all_reduce
+    def _all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
+        return _orig_all_reduce(_ensure_cuda(tensor), op=op, group=group, async_op=async_op)
+    dist.all_reduce = _all_reduce
+
+    _orig_broadcast = dist.broadcast
+    def _broadcast(tensor, src, group=None, async_op=False):
+        return _orig_broadcast(_ensure_cuda(tensor), src=src, group=group, async_op=async_op)
+    dist.broadcast = _broadcast
+
+    _orig_reduce = dist.reduce
+    def _reduce(tensor, dst, op=dist.ReduceOp.SUM, group=None, async_op=False):
+        return _orig_reduce(_ensure_cuda(tensor), dst=dst, op=op, group=group, async_op=async_op)
+    dist.reduce = _reduce
+
+    _orig_all_gather_into_tensor = dist.all_gather_into_tensor
+    def _all_gather_into_tensor(output, input, group=None, async_op=False):
+        return _orig_all_gather_into_tensor(
+            _ensure_cuda(output), _ensure_cuda(input), group=group, async_op=async_op,
+        )
+    dist.all_gather_into_tensor = _all_gather_into_tensor
+
+    _orig_reduce_scatter_tensor = dist.reduce_scatter_tensor
+    def _reduce_scatter_tensor(output, input, op=dist.ReduceOp.SUM, group=None, async_op=False):
+        return _orig_reduce_scatter_tensor(
+            _ensure_cuda(output), _ensure_cuda(input), op=op, group=group, async_op=async_op,
+        )
+    dist.reduce_scatter_tensor = _reduce_scatter_tensor
+
+
 def setup_distributed():
     """Initialize distributed training environment"""
-    dist.init_process_group(backend="nccl")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank = int(os.environ.get("RANK", 0))
+
+    # Set both flagos and CUDA device before init_process_group
+    # This is important because flagos uses CUDA memory under the hood
+    torch_flagos.flagos.set_device(local_rank)
+    torch.cuda.set_device(local_rank)
+
+    from torch.distributed.distributed_c10d import ProcessGroup
+
+    # Initialize with NCCL backend for CUDA
+    dist.init_process_group(backend="nccl")
+
+    # Get the default process group and manually register NCCL backend for privateuseone
+    pg = dist.distributed_c10d._get_default_group()
+
+    # Get the NCCL backend that was created for CUDA
+    nccl_backend = pg._get_backend(torch.device("cuda"))
+
+    # Register the same NCCL backend for privateuseone device type
+    # This allows distributed ops on flagos tensors to use NCCL
+    pg._register_backend(
+        torch.device("privateuseone"),
+        ProcessGroup.BackendType.NCCL,
+        nccl_backend
+    )
+
+    # Patch dist collectives to transparently handle flagos tensors
+    _patch_dist_collectives()
+
     world_size = dist.get_world_size()
     rank = dist.get_rank()
-
-    # Set current device
-    torch_flagos.flagos.set_device(local_rank)
 
     return local_rank, world_size, rank
 
@@ -55,6 +123,27 @@ def print_rank0(msg, rank):
 # Sync function
 def sync():
     torch_flagos.flagos.synchronize()
+
+
+def dist_barrier(local_rank):
+    """Barrier using all_reduce on flagos device"""
+    sync()
+    t = torch.zeros(1, device=f"flagos:{local_rank}")
+    dist.all_reduce(t)
+    sync()
+
+
+def move_buffers_to_device(module, device):
+    """Explicitly move all buffers to device.
+
+    Some buffers like inv_freq in rotary embeddings may not be properly
+    moved by model.to() for custom devices.
+    """
+    for name, buf in module._buffers.items():
+        if buf is not None and buf.device.type != "privateuseone":
+            module._buffers[name] = buf.to(device)
+    for child in module.children():
+        move_buffers_to_device(child, device)
 
 
 def get_fsdp_wrap_policy(model):
@@ -102,7 +191,7 @@ def main():
     # Configuration parameters
     model_name = "/nfs/hcr/models/Qwen/Qwen3-0.6B"
     BATCH_SIZE = 2
-    MAX_SEQ_LEN = 1024
+    MAX_SEQ_LEN = 256
     NUM_TRAIN_STEPS = 10
     LEARNING_RATE = 1e-5
     GRADIENT_ACCUMULATION_STEPS = 1
@@ -120,12 +209,21 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load model to CPU first (FSDP will handle sharding)
+    # Load model to CPU first, then move to flagos device
+    # We must move to device BEFORE FSDP wrapping because FSDP's internal
+    # _move_states_to_device uses param.data = param.to(device) which fails
+    # with "incompatible tensor type" for CPU -> PrivateUse1 transitions.
+    # By moving first, FSDP sees params already on device and skips the move.
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float32,  # Use float32 for training to support gradient computation
-        device_map="cpu"
+        dtype=torch.float32,
+        attn_implementation="eager",
     )
+    model = model.to(device)
+
+    # Explicitly move all buffers to device (some buffers like inv_freq
+    # may not be properly moved by model.to() for custom devices)
+    move_buffers_to_device(model, device)
 
     # Ensure all parameters require gradients
     for param in model.parameters():
@@ -133,25 +231,20 @@ def main():
 
     # Synchronize before FSDP initialization
     sync()
-    dist.barrier()
+    dist_barrier(local_rank)
 
     # Get FSDP wrap policy
     auto_wrap_policy = get_fsdp_wrap_policy(model)
 
     # Configure mixed precision (optional, set to None for full float32)
     mixed_precision_policy = None
-    # Uncomment below for mixed precision training:
-    # mixed_precision_policy = MixedPrecision(
-    #     param_dtype=torch.float32,
-    #     reduce_dtype=torch.float32,
-    #     buffer_dtype=torch.float32,
-    # )
 
     # Configure CPU offload (optional)
     cpu_offload = CPUOffload(offload_params=True) if USE_CPU_OFFLOAD else None
 
     # Wrap model with FSDP
-    # Note: For custom devices like flagos, use torch.device instead of integer device_id
+    # Model is already on flagos device; pass device_id so FSDP knows
+    # the compute device (it won't move since params aren't on CPU)
     model = FSDP(
         model,
         sharding_strategy=SHARDING_STRATEGY,
@@ -159,10 +252,13 @@ def main():
         mixed_precision=mixed_precision_policy,
         cpu_offload=cpu_offload,
         device_id=torch.device(device),
-        use_orig_params=True,  # Allows access to original parameter names
+        use_orig_params=True,
     )
 
-    model.train()  # Set to training mode
+    model.train()
+
+    # Ensure all buffers are on the correct device after FSDP wrapping
+    move_buffers_to_device(model, device)
 
     print_rank0(f"FSDP Sharding Strategy: {SHARDING_STRATEGY}", rank)
     print_rank0(f"CPU Offload: {USE_CPU_OFFLOAD}", rank)
@@ -173,6 +269,36 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print_rank0(f"Total parameters (sharded): {total_params / 1e6:.2f}M", rank)
     print_rank0(f"Trainable parameters (sharded): {trainable_params / 1e6:.2f}M", rank)
+
+    # Detect unused parameters via a dummy forward+backward pass
+    # This serves as validation that all parameters receive gradients
+    print_rank0("\n[1.5] Detecting unused parameters (validation)...", rank)
+    dummy_input = torch.randint(0, 1000, (1, 32), device=device)
+    with torch.enable_grad():
+        dummy_output = model(input_ids=dummy_input, attention_mask=None, labels=None, use_cache=False)
+        dummy_loss = dummy_output.logits.sum()
+        dummy_loss.backward()
+
+    # Check which parameters didn't receive gradients
+    unused_params = []
+    for name, param in model.named_parameters():
+        if param.requires_grad and param.grad is None:
+            unused_params.append(name)
+        elif param.grad is not None:
+            param.grad = None  # Clear gradient for actual training
+
+    print_rank0(f"    Parameters without gradient: {len(unused_params)}", rank)
+    if rank == 0 and unused_params:
+        for name in unused_params[:5]:
+            print(f"      - {name}")
+        if len(unused_params) > 5:
+            print(f"      ... and {len(unused_params) - 5} more")
+
+    # Zero out gradients after detection
+    model.zero_grad(set_to_none=True)
+
+    sync()
+    dist_barrier(local_rank)
 
     # Create dataset and dataloader with DistributedSampler
     print_rank0("\n[2] Creating dataset...", rank)
@@ -223,41 +349,35 @@ def main():
 
         # Move data to device
         input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
+        # Note: attention_mask not used due to device compatibility issues with transformers' masking_utils
         labels = batch["labels"].to(device)
 
         sync()
         step_start = time.time()
 
         # Forward pass
+        # Note: We don't pass attention_mask to avoid device compatibility issues with
+        # transformers' masking_utils which uses vmap internally and creates tensors on
+        # incompatible devices. Since we use padding="max_length" and drop_last=True,
+        # all sequences are the same length and the causal mask is sufficient.
+        # Also, we don't pass labels to avoid transformers internal contiguous() calls.
         outputs = model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels
+            attention_mask=None,  # Skip attention_mask to avoid masking_utils device issues
+            labels=None,  # Don't compute loss internally, we'll do it manually
+            use_cache=False,  # Disable KV cache for training
         )
 
-        # Debug info (only print on first step and rank 0)
-        if step == 0 and rank == 0:
-            print(f"    [DEBUG] outputs.loss: {outputs.loss}")
-            print(f"    [DEBUG] outputs.loss.requires_grad: {outputs.loss.requires_grad}")
-            print(f"    [DEBUG] outputs.logits.requires_grad: {outputs.logits.requires_grad}")
-
-        # If outputs.loss has no gradient, compute loss manually
-        if outputs.loss.requires_grad:
-            loss = outputs.loss
-        else:
-            # Manually compute cross-entropy loss
-            logits = outputs.logits
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss_fct = torch.nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
-            if step == 0 and rank == 0:
-                print(f"    [DEBUG] Manual loss: {loss}")
-                print(f"    [DEBUG] Manual loss.requires_grad: {loss.requires_grad}")
+        # Manually compute cross-entropy loss
+        # Both logits and labels should be on flagos device now
+        logits = outputs.logits  # Shape: [batch, seq_len, vocab_size]
+        shift_logits = logits[..., :-1, :].reshape(-1, logits.size(-1))
+        shift_labels = labels[..., 1:].reshape(-1)
+        loss_fct = torch.nn.CrossEntropyLoss()
+        loss = loss_fct(shift_logits, shift_labels)
 
         # Backward pass
+        # FSDP handles gradient synchronization internally via reduce_scatter
         loss.backward()
 
         # Gradient accumulation

@@ -128,6 +128,12 @@ void wrapper_cpu_fallback(
   at::native::flagos::cpu_fallback(op, stack);
 }
 
+void wrapper_record_stream(at::Tensor& self, at::Stream s) {
+  // No-op for flagos tensors.
+  // flagos uses cudaMalloc directly (not a caching allocator),
+  // so there is no need to track stream usage for memory management.
+}
+
 } // namespace
 
 // Register basic operators for PrivateUse1 dispatch key
@@ -149,6 +155,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("contiguous", wrapper_contiguous);
   m.impl("clone", wrapper_clone);
   m.impl("_to_copy", wrapper__to_copy);
+  m.impl("record_stream", wrapper_record_stream);
 }
 
 // Register fallback for all unimplemented operators
