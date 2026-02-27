@@ -78,6 +78,36 @@ def _lazy_init():
 from .random import *  # noqa: F403
 
 
+# ---------------------------------------------------------------------------
+# Stream API required by FSDP
+# Since flagos shares the same GPU as CUDA, we proxy to torch.cuda streams.
+# ---------------------------------------------------------------------------
+
+class Stream(torch.cuda.Stream):
+    """Flagos stream that wraps a CUDA stream (same GPU memory)."""
+    def __new__(cls, device=None, priority=0, **kwargs):
+        if device is None:
+            device = current_device()
+        return super().__new__(cls, device=device, priority=priority, **kwargs)
+
+
+class Event(torch.cuda.Event):
+    """Flagos event that wraps a CUDA event."""
+    pass
+
+
+def current_stream(device=None):
+    """Return the currently selected stream for the given device."""
+    if device is None:
+        device = current_device()
+    return torch.cuda.current_stream(device)
+
+
+def stream(s):
+    """Context-manager that selects a given stream."""
+    return torch.cuda.stream(s)
+
+
 def get_amp_supported_dtype():
     """Return list of supported dtypes for AMP (Automatic Mixed Precision).
 
@@ -102,4 +132,8 @@ __all__ = [
     "get_rng_state",
     "set_rng_state",
     "get_amp_supported_dtype",
+    "Stream",
+    "Event",
+    "current_stream",
+    "stream",
 ]
