@@ -1,28 +1,37 @@
 """
-Qwen3 Single-GPU Training Test - Using torch_flagos
+Qwen3 Single-GPU Training Baseline - Pure CUDA (no flagos/FlagGems)
 
-On A800 with divice=flagos:
-  Step 1/10: loss=14.0713, time=19.78s, tokens/s=103.5
-  Step 2/10: loss=7.7347, time=16.86s, tokens/s=121.4
-  Step 3/10: loss=5.5335, time=15.76s, tokens/s=129.9
-  Step 4/10: loss=1.8491, time=16.48s, tokens/s=124.3
-  Step 5/10: loss=0.2936, time=15.60s, tokens/s=131.3
+This script uses native CUDA device directly for performance baseline comparison.
+No FlagGems Triton kernels are used; all ops run through PyTorch's default CUDA kernels.
 
+Usage:
+    python tests/test_qwen3_train_baseline.py
+
+On A800 with divice=CUDA:
+  Step 1/10: loss=14.4110, time=0.32s, tokens/s=6435.4
+  Step 2/10: loss=7.4065, time=0.25s, tokens/s=8234.8
+  Step 3/10: loss=2.7476, time=0.25s, tokens/s=8221.4
+  Step 4/10: loss=0.9689, time=0.25s, tokens/s=8296.8
+  Step 5/10: loss=2.0250, time=0.25s, tokens/s=8266.3
+  Step 6/10: loss=0.0954, time=0.25s, tokens/s=8221.6
+  Step 7/10: loss=0.0402, time=0.25s, tokens/s=8287.8
+  Step 8/10: loss=0.0382, time=0.25s, tokens/s=8236.1
+  Step 9/10: loss=0.0340, time=0.25s, tokens/s=8268.9
+  Step 10/10: loss=0.0453, time=0.25s, tokens/s=8285.4
 """
 
 import torch
-import torch_flagos  # Automatically registers FlagGems operators to flagos device
 import time
 
 print("=" * 60)
-print("torch_flagos Qwen3 Single-GPU Training Test")
+print("Qwen3 Single-GPU Training Baseline (Pure CUDA)")
 print("=" * 60)
 
-# Check device status
-print(f"\nFlagos device available: {torch_flagos.flagos.is_available()}")
-print(f"Device count: {torch_flagos.flagos.device_count()}")
-print(f"FlagGems registered: {torch_flagos.is_flaggems_enabled()}")
-print(f"Registered ops count: {len(torch_flagos.get_registered_ops())}")
+# Check CUDA status
+print(f"\nCUDA available: {torch.cuda.is_available()}")
+print(f"CUDA device count: {torch.cuda.device_count()}")
+if torch.cuda.is_available():
+    print(f"CUDA device name: {torch.cuda.get_device_name(0)}")
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling
 from torch.utils.data import DataLoader
@@ -30,7 +39,7 @@ from dummy_dataset import DummyTextDataset
 
 # Configuration parameters
 model_name = "/nfs/hcr/models/Qwen/Qwen3-0.6B"
-DEVICE = "flagos:0"
+DEVICE = "cuda:0"
 BATCH_SIZE = 2
 MAX_SEQ_LEN = 1024
 NUM_TRAIN_STEPS = 10
@@ -39,7 +48,7 @@ GRADIENT_ACCUMULATION_STEPS = 1
 
 # Sync function
 def sync():
-    torch_flagos.flagos.synchronize()
+    torch.cuda.synchronize()
 
 
 def main():
@@ -52,7 +61,7 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load model to CPU, then move to flagos device
+    # Load model directly to CUDA
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float32,  # Use float32 for training to support gradient computation
@@ -120,7 +129,6 @@ def main():
 
     # Training loop
     print(f"\n[4] Starting training ({NUM_TRAIN_STEPS} steps)...")
-    print("    (First run will trigger Triton kernel compilation, may take longer)")
 
     total_tokens = 0
     total_loss = 0.0
@@ -198,7 +206,7 @@ def main():
 
     # Summary statistics
     print("\n" + "=" * 60)
-    print("Training Summary (torch_flagos + FlagGems):")
+    print("Training Summary (Pure CUDA Baseline):")
     print(f"  Total training steps: {NUM_TRAIN_STEPS}")
     print(f"  Average loss: {total_loss / NUM_TRAIN_STEPS:.4f}")
     print(f"  Total tokens: {total_tokens}")
@@ -211,9 +219,8 @@ def main():
         avg_step_time = sum(rest_step_times) / len(rest_step_times)
         tokens_per_step = BATCH_SIZE * MAX_SEQ_LEN
 
-        print(f"  First step (with compilation): {first_step_time:.2f}s ({tokens_per_step/first_step_time:.1f} tokens/s)")
+        print(f"  First step: {first_step_time:.2f}s ({tokens_per_step/first_step_time:.1f} tokens/s)")
         print(f"  Average subsequent steps: {avg_step_time:.2f}s ({tokens_per_step/avg_step_time:.1f} tokens/s)")
-        print(f"  Estimated Triton compilation overhead: {first_step_time - avg_step_time:.2f}s")
     else:
         avg_step_time = step_times[0]
         tokens_per_step = BATCH_SIZE * MAX_SEQ_LEN
@@ -225,7 +232,7 @@ def main():
     print(f"  Overall throughput: {total_tokens / total_time:.1f} tokens/s")
     print("=" * 60)
 
-    print("\nTraining test completed!")
+    print("\nBaseline training test completed!")
 
 
 if __name__ == "__main__":
