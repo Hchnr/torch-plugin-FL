@@ -1,11 +1,15 @@
 """
-Qwen3 FSDP (Fully Sharded Data Parallel) Training Test - Using torch_flagos
+Qwen3 FSDP (Fully Sharded Data Parallel) Training Test - Using torch_flagos + FlagCX
+
+Uses FlagCX as the communication backend instead of NCCL directly.
+FlagCX is an abstraction layer that can route communication through
+different backends (NCCL, HCCL, etc.) depending on the hardware.
 
 Usage:
-    torchrun --nproc_per_node=2 test_qwen3_train_fsdp.py
+    torchrun --nproc_per_node=2 tests/test_qwen3_train_fsdp_flagcx.py
 
     or with more GPUs:
-    torchrun --nproc_per_node=4 test_qwen3_train_fsdp.py
+    torchrun --nproc_per_node=4 tests/test_qwen3_train_fsdp_flagcx.py
 """
 
 import os
@@ -24,6 +28,7 @@ from torch.distributed.fsdp.wrap import (
 )
 from torch.utils.data import DataLoader, DistributedSampler
 import torch_flagos  # Automatically registers FlagGems operators to flagos device
+import flagcx  # FlagCX communication backend (wraps NCCL/HCCL/etc.)
 import time
 from dummy_dataset import DummyTextDataset
 
@@ -72,7 +77,7 @@ def _patch_dist_collectives():
 
 
 def setup_distributed():
-    """Initialize distributed training environment"""
+    """Initialize distributed training environment using FlagCX backend"""
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     rank = int(os.environ.get("RANK", 0))
 
@@ -83,24 +88,39 @@ def setup_distributed():
 
     from torch.distributed.distributed_c10d import ProcessGroup
 
-    # Initialize with NCCL backend for CUDA
-    dist.init_process_group(backend="nccl")
+    # Initialize with FlagCX backend for GPU communication (instead of NCCL directly).
+    # FlagCX is an abstraction layer that routes to the appropriate vendor backend
+    # (e.g. NCCL for NVIDIA, HCCL for Ascend, etc.).
+    # Format: "cpu_backend:gloo,gpu_backend:flagcx"
+    dist.init_process_group(backend="cpu:gloo,cuda:flagcx")
 
-    # Get the default process group and manually register NCCL backend for privateuseone
+    # Get the default process group and register FlagCX backend for privateuseone
     pg = dist.distributed_c10d._get_default_group()
 
-    # Get the NCCL backend that was created for CUDA
-    nccl_backend = pg._get_backend(torch.device("cuda"))
+    # Get the FlagCX backend that was created for CUDA
+    flagcx_backend = pg._get_backend(torch.device("cuda"))
 
-    # Register the same NCCL backend for privateuseone device type
-    # This allows distributed ops on flagos tensors to use NCCL
+    # Register the same FlagCX backend for privateuseone device type
+    # This allows distributed ops on flagos tensors to use FlagCX
     pg._register_backend(
         torch.device("privateuseone"),
-        ProcessGroup.BackendType.NCCL,
-        nccl_backend
+        ProcessGroup.BackendType.CUSTOM,
+        flagcx_backend
     )
 
+    # Debug: print registered backends
+    if int(os.environ.get("RANK", 0)) == 0:
+        print(f"[DEBUG] Backend config: {dist.get_backend_config()}", flush=True)
+        print(f"[DEBUG] Process group device types: {pg._device_types}", flush=True)
+        try:
+            pu1_backend = pg._get_backend(torch.device("privateuseone"))
+            print(f"[DEBUG] PrivateUse1 backend: {type(pu1_backend).__name__}", flush=True)
+        except Exception as e:
+            print(f"[DEBUG] Failed to get PrivateUse1 backend: {e}", flush=True)
+
     # Patch dist collectives to transparently handle flagos tensors
+    # (still needed because flagos tensors must be converted to CUDA views
+    # before passing to FlagCX's underlying communication)
     _patch_dist_collectives()
 
     world_size = dist.get_world_size()
