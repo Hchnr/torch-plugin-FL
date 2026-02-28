@@ -345,6 +345,7 @@ from torch_flagos.integration import (
 
 __all__ = [
     "flagos",
+    "distributed",
     "get_registered_ops",
     "is_flaggems_enabled",
     "is_flaggems_available",
