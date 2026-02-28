@@ -1,223 +1,605 @@
 """
-Qwen3 Single-GPU Training Test - Using torch_flagos
+Qwen3 Training Test - Unified script supporting multiple configurations.
+
+Supports:
+  - Device: cuda (baseline) or flagos (FlagGems Triton kernels)
+  - Parallel: none (single GPU), ddp, or fsdp
+  - Communication backend: nccl or flagcx (for ddp/fsdp)
+
+Usage:
+    # Single GPU, pure CUDA baseline
+    python tests/test_qwen3_train.py --device cuda
+
+    # Single GPU, flagos (FlagGems)
+    python tests/test_qwen3_train.py --device flagos
+
+    # DDP with FlagCX
+    torchrun --nproc_per_node=2 tests/test_qwen3_train.py --parallel ddp --comm flagcx
+
+    # FSDP with NCCL
+    torchrun --nproc_per_node=2 tests/test_qwen3_train.py --parallel fsdp --comm nccl
 """
 
-import torch
-import torch_flagos  # Automatically registers FlagGems operators to flagos device
+import argparse
+import functools
+import os
 import time
 
-print("=" * 60)
-print("torch_flagos Qwen3 Single-GPU Training Test")
-print("=" * 60)
-
-# Check device status
-print(f"\nFlagos device available: {torch_flagos.flagos.is_available()}")
-print(f"Device count: {torch_flagos.flagos.device_count()}")
-print(f"FlagGems registered: {torch_flagos.is_flaggems_enabled()}")
-print(f"Registered ops count: {len(torch_flagos.get_registered_ops())}")
-
-from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling
-from torch.utils.data import DataLoader
+import torch
+import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
 from dummy_dataset import DummyTextDataset
 
-# Configuration parameters
-model_name = "/nfs/hcr/models/Qwen/Qwen3-0.6B"
-DEVICE = "flagos:0"
-BATCH_SIZE = 2
-MAX_SEQ_LEN = 1024
-NUM_TRAIN_STEPS = 10
-LEARNING_RATE = 1e-5
-GRADIENT_ACCUMULATION_STEPS = 1
 
-# Sync function
-def sync():
-    torch_flagos.flagos.synchronize()
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Qwen3 Training Test")
+    parser.add_argument("--device", choices=["cuda", "flagos"], default="flagos",
+                        help="Device type (default: flagos)")
+    parser.add_argument("--parallel", choices=["none", "ddp", "fsdp"], default="none",
+                        help="Parallel strategy (default: none)")
+    parser.add_argument("--comm", choices=["nccl", "flagcx"], default="nccl",
+                        help="Communication backend for distributed (default: nccl)")
+    parser.add_argument("--model", default="/nfs/hcr/models/Qwen/Qwen3-0.6B",
+                        help="Model path")
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--seq-len", type=int, default=None,
+                        help="Sequence length (default: 1024 for single, 256 for distributed)")
+    parser.add_argument("--steps", type=int, default=10)
+    parser.add_argument("--lr", type=float, default=1e-5)
+    args = parser.parse_args()
+    # Default seq-len based on parallel mode
+    if args.seq_len is None:
+        args.seq_len = 256 if args.parallel != "none" else 1024
+    return args
 
 
-def main():
-    # Load model
-    print("\n[1] Loading model and tokenizer...")
+# ---------------------------------------------------------------------------
+# Conditional imports (lazy)
+# ---------------------------------------------------------------------------
+
+_torch_flagos = None  # populated by _import_flagos()
+
+
+def _import_flagos():
+    global _torch_flagos
+    if _torch_flagos is None:
+        import torch_flagos
+        _torch_flagos = torch_flagos
+    return _torch_flagos
+
+
+def _import_flagcx():
+    import flagcx  # noqa: F401 — registers "flagcx" backend via torch.backends entry point
+    return flagcx
+
+
+# ---------------------------------------------------------------------------
+# Sync & printing utilities
+# ---------------------------------------------------------------------------
+
+def sync(args):
+    if args.device == "flagos":
+        _import_flagos().flagos.synchronize()
+    else:
+        torch.cuda.synchronize()
+
+
+def print_rank0(msg, rank):
+    if rank == 0:
+        print(msg)
+
+
+# ---------------------------------------------------------------------------
+# flagos-specific helpers
+# ---------------------------------------------------------------------------
+
+def move_buffers_to_device(module, device):
+    """Move all buffers to device (needed for flagos custom device)."""
+    for name, buf in module._buffers.items():
+        if buf is not None and buf.device.type != "privateuseone":
+            module._buffers[name] = buf.to(device)
+    for child in module.children():
+        move_buffers_to_device(child, device)
+
+
+def _patch_dist_collectives():
+    """Patch torch.distributed collectives to transparently handle flagos tensors."""
+    import torch_flagos._C as _C
+
+    def _ensure_cuda(tensor):
+        if tensor.device.type in ("privateuseone", "flagos"):
+            return _C._flagos_to_cuda_view(tensor)
+        return tensor
+
+    _orig_all_reduce = dist.all_reduce
+    def _all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
+        return _orig_all_reduce(_ensure_cuda(tensor), op=op, group=group, async_op=async_op)
+    dist.all_reduce = _all_reduce
+
+    _orig_broadcast = dist.broadcast
+    def _broadcast(tensor, src, group=None, async_op=False):
+        return _orig_broadcast(_ensure_cuda(tensor), src=src, group=group, async_op=async_op)
+    dist.broadcast = _broadcast
+
+    _orig_reduce = dist.reduce
+    def _reduce(tensor, dst, op=dist.ReduceOp.SUM, group=None, async_op=False):
+        return _orig_reduce(_ensure_cuda(tensor), dst=dst, op=op, group=group, async_op=async_op)
+    dist.reduce = _reduce
+
+    _orig_all_gather_into_tensor = dist.all_gather_into_tensor
+    def _all_gather_into_tensor(output, input, group=None, async_op=False):
+        return _orig_all_gather_into_tensor(
+            _ensure_cuda(output), _ensure_cuda(input), group=group, async_op=async_op,
+        )
+    dist.all_gather_into_tensor = _all_gather_into_tensor
+
+    _orig_reduce_scatter_tensor = dist.reduce_scatter_tensor
+    def _reduce_scatter_tensor(output, input, op=dist.ReduceOp.SUM, group=None, async_op=False):
+        return _orig_reduce_scatter_tensor(
+            _ensure_cuda(output), _ensure_cuda(input), op=op, group=group, async_op=async_op,
+        )
+    dist.reduce_scatter_tensor = _reduce_scatter_tensor
+
+
+# ---------------------------------------------------------------------------
+# Device & distributed setup
+# ---------------------------------------------------------------------------
+
+def setup(args):
+    """Initialize device and (optionally) distributed environment.
+
+    Returns (device_str, local_rank, world_size, rank).
+    """
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank = int(os.environ.get("RANK", 0))
+
+    if args.device == "flagos":
+        tf = _import_flagos()
+        tf.flagos.set_device(local_rank)
+    torch.cuda.set_device(local_rank)
+
+    if args.parallel == "none":
+        return f"{args.device}:{local_rank}", local_rank, 1, 0
+
+    # --- Distributed init ---
+    from torch.distributed.distributed_c10d import ProcessGroup
+
+    if args.comm == "flagcx":
+        _import_flagcx()
+        dist.init_process_group(backend="cpu:gloo,cuda:flagcx")
+    else:
+        dist.init_process_group(backend="nccl")
+
+    if args.device == "flagos":
+        # Register the GPU backend for privateuseone so dist ops work on flagos tensors
+        pg = dist.distributed_c10d._get_default_group()
+        gpu_backend = pg._get_backend(torch.device("cuda"))
+        backend_type = (ProcessGroup.BackendType.CUSTOM if args.comm == "flagcx"
+                        else ProcessGroup.BackendType.NCCL)
+        pg._register_backend(torch.device("privateuseone"), backend_type, gpu_backend)
+        _patch_dist_collectives()
+
+    # Debug info
+    if rank == 0:
+        pg = dist.distributed_c10d._get_default_group()
+        print(f"[DEBUG] Backend config: {dist.get_backend_config()}", flush=True)
+        print(f"[DEBUG] Process group device types: {pg._device_types}", flush=True)
+
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    device = f"{args.device}:{local_rank}"
+    return device, local_rank, world_size, rank
+
+
+def cleanup(args):
+    if args.parallel != "none":
+        dist.destroy_process_group()
+
+
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
+
+def load_model(args, device, rank):
+    """Load model and tokenizer, detect & freeze unused params."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    print_rank0("\n[1] Loading model and tokenizer...", rank)
     load_start = time.time()
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    # Set pad_token
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load model to CPU, then move to flagos device
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float32,  # Use float32 for training to support gradient computation
-        device_map="cpu"
-    )
-    model = model.to(DEVICE)
-    model.train()  # Set to training mode
+    load_kwargs = dict(torch_dtype=torch.float32, device_map="cpu")
+    if args.device == "flagos":
+        load_kwargs["attn_implementation"] = "eager"
 
-    # Ensure all parameters require gradients
+    model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
+    model = model.to(device)
+
+    if args.device == "flagos":
+        move_buffers_to_device(model, device)
+
+    model.train()
     for param in model.parameters():
         param.requires_grad = True
 
-    # Pre-warmup: Detect and freeze unused parameters.
-    # This is necessary because some parameters (e.g. in rotary embeddings) may not
-    # receive gradients during training. Freezing them avoids errors during backward pass.
-    print("\n[1.5] Detecting and freezing unused parameters...")
-
-    # Do a forward + backward pass to detect which parameters don't receive gradients
-    dummy_input = torch.randint(0, 1000, (1, 32), device=DEVICE)
+    # Detect and freeze unused parameters
+    print_rank0("\n[1.5] Detecting and freezing unused parameters...", rank)
+    dummy_input = torch.randint(0, 1000, (1, 32), device=device)
     with torch.enable_grad():
-        dummy_output = model(input_ids=dummy_input, attention_mask=None, labels=None, use_cache=False)
-        dummy_loss = dummy_output.logits.sum()
-        dummy_loss.backward()
+        out = model(input_ids=dummy_input, attention_mask=None, labels=None, use_cache=False)
+        out.logits.sum().backward()
 
-    # Find and freeze parameters that didn't receive gradients
     unused_params = []
     for name, param in model.named_parameters():
         if param.grad is None:
             param.requires_grad = False
             unused_params.append(name)
         else:
-            param.grad = None  # Clear gradient for actual training
+            param.grad = None
 
-    print(f"    Frozen {len(unused_params)} unused parameters")
-    if unused_params:
+    print_rank0(f"    Frozen {len(unused_params)} unused parameters", rank)
+    if rank == 0 and unused_params:
         for name in unused_params[:5]:
             print(f"      - {name}")
         if len(unused_params) > 5:
             print(f"      ... and {len(unused_params) - 5} more")
 
-    sync()
+    sync(args)
+    print_rank0(f"Model device: {next(model.parameters()).device}", rank)
+    print_rank0(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M", rank)
+    print_rank0(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}M", rank)
+    print_rank0(f"Model load time: {time.time() - load_start:.2f}s", rank)
 
-    print(f"Model device: {next(model.parameters()).device}")
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
-    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}M")
-    print(f"Model load time: {time.time() - load_start:.2f}s")
+    return model, tokenizer
 
-    # Create dataset and dataloader
-    print("\n[2] Creating dataset...")
-    dataset = DummyTextDataset(tokenizer, num_samples=100, max_length=MAX_SEQ_LEN)
+
+# ---------------------------------------------------------------------------
+# DDP wrapping
+# ---------------------------------------------------------------------------
+
+def wrap_ddp(model, args, local_rank, rank):
+    """Wrap model with DDP."""
+    from torch.nn.parallel import DistributedDataParallel as DDP
+
+    if args.device == "flagos":
+        # flagos needs python_reducer mode because PyTorch's C++ Reducer
+        # uses CUDA Future which fails for privateuseone tensors.
+        import torch._dynamo.utils
+        _orig = torch._dynamo.utils.get_optimize_ddp_mode
+        torch._dynamo.utils.get_optimize_ddp_mode = lambda: "python_reducer"
+        try:
+            model = DDP(model, init_sync=False, broadcast_buffers=False, gradient_as_bucket_view=True)
+        finally:
+            torch._dynamo.utils.get_optimize_ddp_mode = _orig
+
+        # Replace default accum_grad_hooks with flagos-compatible version
+        for h in model._accum_grad_hooks:
+            h.remove()
+        model._accum_grad_hooks.clear()
+
+        def _accum_grad_hook(param, *, ddp_model):
+            if not ddp_model.require_backward_grad_sync:
+                return
+            if param.grad is None:
+                return
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+            param.grad.div_(dist.get_world_size())
+
+        for param in model._module_parameters:
+            if param.requires_grad:
+                model._accum_grad_hooks.append(
+                    param.register_post_accumulate_grad_hook(
+                        functools.partial(_accum_grad_hook, ddp_model=model)
+                    )
+                )
+        print_rank0("    DDP: python_reducer + custom grad hooks (flagos)", rank)
+    else:
+        model = DDP(model, device_ids=[local_rank])
+        print_rank0("    DDP: standard mode (CUDA)", rank)
+
+    return model
+
+
+# ---------------------------------------------------------------------------
+# FSDP wrapping
+# ---------------------------------------------------------------------------
+
+def wrap_fsdp(model, args, device, rank):
+    """Wrap model with FSDP."""
+    from torch.distributed.fsdp import (
+        FullyShardedDataParallel as FSDP,
+        ShardingStrategy,
+    )
+    from torch.distributed.fsdp.wrap import (
+        transformer_auto_wrap_policy,
+        size_based_auto_wrap_policy,
+    )
+
+    # Determine wrap policy
+    try:
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+        wrap_cls = Qwen3DecoderLayer
+    except ImportError:
+        try:
+            from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+            wrap_cls = Qwen2DecoderLayer
+        except ImportError:
+            wrap_cls = None
+
+    if wrap_cls is not None:
+        auto_wrap_policy = functools.partial(
+            transformer_auto_wrap_policy, transformer_layer_cls={wrap_cls}
+        )
+    else:
+        auto_wrap_policy = functools.partial(
+            size_based_auto_wrap_policy, min_num_params=1e6
+        )
+
+    if args.device == "flagos":
+        move_buffers_to_device(model, device)
+
+    model = FSDP(
+        model,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        auto_wrap_policy=auto_wrap_policy,
+        device_id=torch.device(device),
+        use_orig_params=True,
+    )
+    model.train()
+
+    if args.device == "flagos":
+        move_buffers_to_device(model, device)
+
+    # Validate: detect unused parameters via dummy forward+backward
+    print_rank0("\n[1.5b] Validating FSDP gradient flow...", rank)
+    dummy_input = torch.randint(0, 1000, (1, 32), device=device)
+    with torch.enable_grad():
+        out = model(input_ids=dummy_input, attention_mask=None, labels=None, use_cache=False)
+        out.logits.sum().backward()
+
+    unused = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
+    print_rank0(f"    Parameters without gradient: {len(unused)}", rank)
+    model.zero_grad(set_to_none=True)
+
+    print_rank0(f"    FSDP: FULL_SHARD (device={args.device})", rank)
+    return model
+
+
+# ---------------------------------------------------------------------------
+# DataLoader
+# ---------------------------------------------------------------------------
+
+def create_dataloader(args, tokenizer, world_size, rank):
+    """Create dataloader (with DistributedSampler if distributed)."""
+    dataset = DummyTextDataset(tokenizer, num_samples=100, max_length=args.seq_len)
+    sampler = None
+    if args.parallel != "none":
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
     dataloader = DataLoader(
         dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        drop_last=True
+        batch_size=args.batch_size,
+        sampler=sampler,
+        shuffle=(sampler is None),
+        drop_last=True,
     )
-    print(f"Dataset size: {len(dataset)}")
-    print(f"Batch size: {BATCH_SIZE}")
-    print(f"Sequence length: {MAX_SEQ_LEN}")
+    return dataloader, sampler
 
-    # Create optimizer
-    print("\n[3] Creating optimizer...")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    print(f"Optimizer: AdamW, learning rate: {LEARNING_RATE}")
 
-    # Training loop
-    print(f"\n[4] Starting training ({NUM_TRAIN_STEPS} steps)...")
-    print("    (First run will trigger Triton kernel compilation, may take longer)")
+# ---------------------------------------------------------------------------
+# Training step
+# ---------------------------------------------------------------------------
+
+def train_step(model, batch, device, args):
+    """Forward + loss computation.
+
+    Returns (loss, batch_tokens).
+    """
+    input_ids = batch["input_ids"].to(device)
+    labels = batch["labels"].to(device)
+
+    if args.device == "flagos":
+        # Skip attention_mask and labels to avoid transformers masking_utils
+        # device compatibility issues with custom devices.
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=None,
+            labels=None,
+            use_cache=False,
+        )
+        logits = outputs.logits
+        shift_logits = logits[..., :-1, :].reshape(-1, logits.size(-1))
+        shift_labels = labels[..., 1:].reshape(-1)
+        loss = torch.nn.functional.cross_entropy(shift_logits, shift_labels)
+    else:
+        attention_mask = batch["attention_mask"].to(device)
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+        )
+        if outputs.loss.requires_grad:
+            loss = outputs.loss
+        else:
+            logits = outputs.logits
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = torch.nn.functional.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+            )
+
+    return loss, input_ids.numel()
+
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+
+def print_summary(args, step_times, total_loss, total_tokens, world_size, rank):
+    label_parts = []
+    if args.device == "flagos":
+        label_parts.append("flagos + FlagGems")
+    else:
+        label_parts.append("Pure CUDA")
+    if args.parallel != "none":
+        label_parts.append(args.parallel.upper())
+    if args.parallel != "none":
+        label_parts.append(args.comm.upper())
+    label = " | ".join(label_parts)
+
+    print_rank0("\n" + "=" * 60, rank)
+    print_rank0(f"Training Summary ({label}):", rank)
+    if args.parallel != "none":
+        print_rank0(f"  World size: {world_size} GPUs", rank)
+    print_rank0(f"  Total training steps: {args.steps}", rank)
+    print_rank0(f"  Average loss: {total_loss / args.steps:.4f}", rank)
+    if args.parallel != "none":
+        print_rank0(f"  Total tokens (per GPU): {total_tokens}", rank)
+        print_rank0(f"  Total tokens (all GPUs): {total_tokens * world_size}", rank)
+    else:
+        print_rank0(f"  Total tokens: {total_tokens}", rank)
+    print_rank0("-" * 60, rank)
+
+    tokens_per_step = args.batch_size * args.seq_len
+    suffix = " per GPU" if args.parallel != "none" else ""
+
+    if len(step_times) > 1:
+        first = step_times[0]
+        rest = step_times[1:]
+        avg = sum(rest) / len(rest)
+        print_rank0(f"  First step: {first:.2f}s ({tokens_per_step/first:.1f} tokens/s{suffix})", rank)
+        print_rank0(f"  Average subsequent steps: {avg:.2f}s ({tokens_per_step/avg:.1f} tokens/s{suffix})", rank)
+    else:
+        avg = step_times[0]
+        print_rank0(f"  Average per step: {avg:.2f}s ({tokens_per_step/avg:.1f} tokens/s{suffix})", rank)
+
+    print_rank0("-" * 60, rank)
+    total_time = sum(step_times)
+    print_rank0(f"  Total training time: {total_time:.2f}s", rank)
+    print_rank0(f"  Overall throughput{suffix}: {total_tokens / total_time:.1f} tokens/s", rank)
+    if args.parallel != "none":
+        print_rank0(f"  Overall throughput (all GPUs): {total_tokens * world_size / total_time:.1f} tokens/s", rank)
+    print_rank0("=" * 60, rank)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    args = parse_args()
+
+    # --- Setup ---
+    device, local_rank, world_size, rank = setup(args)
+
+    label_parts = [args.device.upper()]
+    if args.parallel != "none":
+        label_parts.append(args.parallel.upper())
+        label_parts.append(args.comm.upper())
+
+    print_rank0("=" * 60, rank)
+    print_rank0(f"Qwen3 Training Test [{' | '.join(label_parts)}]", rank)
+    print_rank0("=" * 60, rank)
+
+    if args.device == "flagos":
+        tf = _import_flagos()
+        print_rank0(f"Flagos device available: {tf.flagos.is_available()}", rank)
+        print_rank0(f"FlagGems registered: {tf.is_flaggems_enabled()}", rank)
+        print_rank0(f"Registered ops count: {len(tf.get_registered_ops())}", rank)
+    else:
+        print_rank0(f"CUDA available: {torch.cuda.is_available()}", rank)
+        if torch.cuda.is_available():
+            print_rank0(f"CUDA device: {torch.cuda.get_device_name(local_rank)}", rank)
+
+    if args.parallel != "none":
+        print_rank0(f"World size: {world_size}, rank: {rank}, local_rank: {local_rank}", rank)
+
+    # --- Load model ---
+    model, tokenizer = load_model(args, device, rank)
+
+    # --- Distributed barrier before wrapping ---
+    if args.parallel != "none":
+        sync(args)
+        # barrier via all_reduce
+        t = torch.zeros(1, device=device)
+        dist.all_reduce(t)
+        sync(args)
+
+    # --- Wrap model ---
+    if args.parallel == "ddp":
+        model = wrap_ddp(model, args, local_rank, rank)
+    elif args.parallel == "fsdp":
+        model = wrap_fsdp(model, args, device, rank)
+
+    # --- DataLoader ---
+    print_rank0("\n[2] Creating dataset...", rank)
+    dataloader, sampler = create_dataloader(args, tokenizer, world_size, rank)
+    print_rank0(f"Dataset size: {len(dataloader.dataset)}", rank)
+    print_rank0(f"Batch size{' per GPU' if args.parallel != 'none' else ''}: {args.batch_size}", rank)
+    if args.parallel != "none":
+        print_rank0(f"Global batch size: {args.batch_size * world_size}", rank)
+    print_rank0(f"Sequence length: {args.seq_len}", rank)
+
+    # --- Optimizer ---
+    print_rank0("\n[3] Creating optimizer...", rank)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    print_rank0(f"Optimizer: AdamW, lr={args.lr}", rank)
+
+    # --- Training loop ---
+    parallel_label = f" {args.parallel.upper()}" if args.parallel != "none" else ""
+    print_rank0(f"\n[4] Starting{parallel_label} training ({args.steps} steps)...", rank)
 
     total_tokens = 0
     total_loss = 0.0
     step_times = []
 
+    if sampler is not None:
+        sampler.set_epoch(0)
     data_iter = iter(dataloader)
 
-    for step in range(NUM_TRAIN_STEPS):
-        # Get data batch
+    for step in range(args.steps):
         try:
             batch = next(data_iter)
         except StopIteration:
+            if sampler is not None:
+                sampler.set_epoch(step + 1)
             data_iter = iter(dataloader)
             batch = next(data_iter)
 
-        # Move data to device
-        input_ids = batch["input_ids"].to(DEVICE)
-        attention_mask = batch["attention_mask"].to(DEVICE)
-        labels = batch["labels"].to(DEVICE)
-
-        sync()
+        sync(args)
         step_start = time.time()
 
-        # Forward pass
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels
-        )
-
-        # Debug info (only print on first step)
-        if step == 0:
-            print(f"    [DEBUG] outputs.loss: {outputs.loss}")
-            print(f"    [DEBUG] outputs.loss.requires_grad: {outputs.loss.requires_grad}")
-            print(f"    [DEBUG] outputs.logits.requires_grad: {outputs.logits.requires_grad}")
-
-        # If outputs.loss has no gradient, compute loss manually
-        if outputs.loss.requires_grad:
-            loss = outputs.loss
-        else:
-            # Manually compute cross-entropy loss
-            logits = outputs.logits
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss_fct = torch.nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
-            if step == 0:
-                print(f"    [DEBUG] Manual loss: {loss}")
-                print(f"    [DEBUG] Manual loss.requires_grad: {loss.requires_grad}")
-
-        # Backward pass
+        loss, batch_tokens = train_step(model, batch, device, args)
         loss.backward()
 
-        # Gradient accumulation
-        if (step + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
-            optimizer.step()
-            optimizer.zero_grad()
+        optimizer.step()
+        optimizer.zero_grad()
 
-        sync()
+        sync(args)
         step_time = time.time() - step_start
         step_times.append(step_time)
 
-        # Statistics
-        batch_tokens = input_ids.numel()
         total_tokens += batch_tokens
         total_loss += loss.item()
 
-        tokens_per_sec = batch_tokens / step_time
+        print_rank0(
+            f"  Step {step + 1}/{args.steps}: "
+            f"loss={loss.item():.4f}, time={step_time:.2f}s, "
+            f"tokens/s={batch_tokens / step_time:.1f}",
+            rank,
+        )
 
-        print(f"  Step {step + 1}/{NUM_TRAIN_STEPS}: "
-              f"loss={loss.item():.4f}, "
-              f"time={step_time:.2f}s, "
-              f"tokens/s={tokens_per_sec:.1f}")
+    # --- Summary ---
+    print_summary(args, step_times, total_loss, total_tokens, world_size, rank)
+    print_rank0("\nTraining test completed!", rank)
 
-    # Summary statistics
-    print("\n" + "=" * 60)
-    print("Training Summary (torch_flagos + FlagGems):")
-    print(f"  Total training steps: {NUM_TRAIN_STEPS}")
-    print(f"  Average loss: {total_loss / NUM_TRAIN_STEPS:.4f}")
-    print(f"  Total tokens: {total_tokens}")
-    print("-" * 60)
-
-    # Exclude first step (includes compilation overhead)
-    if len(step_times) > 1:
-        first_step_time = step_times[0]
-        rest_step_times = step_times[1:]
-        avg_step_time = sum(rest_step_times) / len(rest_step_times)
-        tokens_per_step = BATCH_SIZE * MAX_SEQ_LEN
-
-        print(f"  First step (with compilation): {first_step_time:.2f}s ({tokens_per_step/first_step_time:.1f} tokens/s)")
-        print(f"  Average subsequent steps: {avg_step_time:.2f}s ({tokens_per_step/avg_step_time:.1f} tokens/s)")
-        print(f"  Estimated Triton compilation overhead: {first_step_time - avg_step_time:.2f}s")
-    else:
-        avg_step_time = step_times[0]
-        tokens_per_step = BATCH_SIZE * MAX_SEQ_LEN
-        print(f"  Average per step: {avg_step_time:.2f}s ({tokens_per_step/avg_step_time:.1f} tokens/s)")
-
-    print("-" * 60)
-    total_time = sum(step_times)
-    print(f"  Total training time: {total_time:.2f}s")
-    print(f"  Overall throughput: {total_tokens / total_time:.1f} tokens/s")
-    print("=" * 60)
-
-    print("\nTraining test completed!")
+    cleanup(args)
 
 
 if __name__ == "__main__":
