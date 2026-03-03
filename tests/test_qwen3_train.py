@@ -142,10 +142,6 @@ def load_model(args, device, rank):
     model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
     model = model.to(device)
 
-    if args.device == "flagos":
-        import torch_flagos.distributed as flagos_dist
-        flagos_dist.move_buffers_to_device(model, device)
-
     model.train()
 
     # Detect and freeze unused parameters
@@ -230,10 +226,6 @@ def wrap_fsdp(model, args, device, rank):
             size_based_auto_wrap_policy, min_num_params=1e6
         )
 
-    if args.device == "flagos":
-        import torch_flagos.distributed as flagos_dist
-        flagos_dist.move_buffers_to_device(model, device)
-
     model = FSDP(
         model,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
@@ -243,15 +235,12 @@ def wrap_fsdp(model, args, device, rank):
     )
     model.train()
 
-    if args.device == "flagos":
-        import torch_flagos.distributed as flagos_dist
-        flagos_dist.move_buffers_to_device(model, device)
-
     # Validate: detect unused parameters via dummy forward+backward
     print_rank0("\n[1.5b] Validating FSDP gradient flow...", rank)
     dummy_input = torch.randint(0, 1000, (1, 32), device=device)
     with torch.enable_grad():
-        out = model(input_ids=dummy_input, attention_mask=None, labels=None, use_cache=False)
+        # out = model(input_ids=dummy_input, attention_mask=None, labels=None, use_cache=False)
+        out = model(input_ids=dummy_input, use_cache=False)
         out.logits.sum().backward()
 
     unused = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
@@ -292,37 +281,16 @@ def train_step(model, batch, device, args):
     Returns (loss, batch_tokens).
     """
     input_ids = batch["input_ids"].to(device)
+    attention_mask = batch["attention_mask"].to(device)
     labels = batch["labels"].to(device)
 
-    if args.device == "flagos":
-        # Skip attention_mask and labels to avoid transformers masking_utils
-        # device compatibility issues with custom devices.
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=None,
-            labels=None,
-            use_cache=False,
-        )
-        logits = outputs.logits
-        shift_logits = logits[..., :-1, :].reshape(-1, logits.size(-1))
-        shift_labels = labels[..., 1:].reshape(-1)
-        loss = torch.nn.functional.cross_entropy(shift_logits, shift_labels)
-    else:
-        attention_mask = batch["attention_mask"].to(device)
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-        )
-        if outputs.loss.requires_grad:
-            loss = outputs.loss
-        else:
-            logits = outputs.logits
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = torch.nn.functional.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-            )
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        labels=labels,
+        use_cache=False,
+    )
+    loss = outputs.loss
 
     return loss, input_ids.numel()
 
