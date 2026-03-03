@@ -83,6 +83,98 @@ torch_flagos.flagos.current_device()  # -> int
 torch_flagos.flagos.set_device(device_id)
 ```
 
+## Testing
+
+Use `tests/test_qwen.sh` to run Qwen3 training tests across multiple configurations (single GPU, DDP, FSDP) with automatic GPU pool scheduling.
+
+```bash
+cd torch-plugin-FL
+
+# Default: 3 training steps, auto-detect GPUs
+bash tests/test_qwen.sh
+
+# Custom step count
+bash tests/test_qwen.sh 10
+
+# Custom steps + log directory
+bash tests/test_qwen.sh 3 logs/run1
+
+# Manually specify GPU count
+NUM_GPUS=4 bash tests/test_qwen.sh
+```
+
+The script runs the following test configurations in parallel (when GPUs are available):
+
+| Task | GPUs | Description |
+|------|------|-------------|
+| `cuda_single` | 1 | Single GPU, pure CUDA baseline |
+| `flagos_single` | 1 | Single GPU, flagos (FlagGems) |
+| `ddp_nccl` | 2 | DDP with NCCL backend |
+| `ddp_flagcx` | 2 | DDP with FlagCX backend |
+| `fsdp_flagcx` | 2 | FSDP with FlagCX backend |
+
+Logs are saved to `tests/logs/<timestamp>/` with one file per task. The script prints a pass/fail summary at the end.
+
+You can also run individual configurations directly:
+
+```bash
+# Single GPU
+python tests/test_qwen3_train.py --device cuda
+python tests/test_qwen3_train.py --device flagos
+
+# DDP
+torchrun --nproc_per_node=2 tests/test_qwen3_train.py --parallel ddp --comm nccl
+torchrun --nproc_per_node=2 tests/test_qwen3_train.py --parallel ddp --comm flagcx
+
+# FSDP
+torchrun --nproc_per_node=2 tests/test_qwen3_train.py --parallel fsdp --comm nccl
+torchrun --nproc_per_node=2 tests/test_qwen3_train.py --parallel fsdp --comm flagcx
+```
+
+## Project Structure
+
+```
+torch-plugin-FL/
+├── CMakeLists.txt                  # Top-level CMake build
+├── setup.py / pyproject.toml       # Python packaging
+├── csrc/                           # C++ source code
+│   ├── aten/                       # Operator dispatch & registration
+│   │   ├── FlagosMinimal.cpp       #   PrivateUse1 operator dispatch registrations
+│   │   └── native/                 #   Native implementations
+│   │       ├── Minimal.cpp         #     Basic tensor ops (empty, set_, copy, clone, etc.)
+│   │       └── Common.h            #     Shared helpers
+│   └── runtime/                    # Device runtime layer
+│       ├── FlagosFunctions.cpp/h   #   Device management (set/get/exchange device)
+│       ├── FlagosDeviceAllocator.* #   GPU memory allocation (wraps cudaMalloc)
+│       ├── FlagosHostAllocator.*   #   Pinned host memory allocation
+│       ├── FlagosGenerator.*       #   Random number generator
+│       ├── FlagosHooks.*           #   PyTorch backend hooks integration
+│       ├── FlagosGuard.*           #   Device guard (RAII device switching)
+│       └── FlagosException.h       #   Error handling
+├── third_party/
+│   └── flagos/                     # Low-level device abstraction (CUDA wrappers)
+│       ├── include/flagos.h        #   C API (foSetDevice, foMalloc, foStream, etc.)
+│       └── csrc/                   #   Implementation (thin wrappers around CUDA APIs)
+├── torch_flagos/                   # Python package
+│   ├── __init__.py                 #   Entry point: registers FlagGems ops on import
+│   ├── integration.py              #   FlagGems operator registration logic
+│   ├── distributed.py              #   Distributed training (DDP/FSDP support for flagos)
+│   ├── _utils.py                   #   Utility functions
+│   ├── flagos/                     #   Device module (torch_flagos.flagos)
+│   │   ├── __init__.py             #     Device APIs (set_device, synchronize, etc.)
+│   │   ├── random.py               #     RNG APIs
+│   │   └── meta.py                 #     Device metadata
+│   ├── csrc/                       #   Python C extension
+│   │   └── Module.cpp              #     _C module (flagos<->CUDA view conversions)
+│   └── lib/                        #   Built shared libraries
+└── tests/                          # Test suite
+    ├── test_qwen.sh                #   GPU pool scheduler for parallel test execution
+    ├── test_qwen3_train.py         #   Qwen3 training test (single/DDP/FSDP)
+    ├── test_qwen3_infer.py         #   Qwen3 inference test
+    ├── test.py                     #   Basic operator tests
+    └── dummy_dataset.py            #   Synthetic dataset for training tests
+```
+
 ## Architecture
 
 The package consists of:
