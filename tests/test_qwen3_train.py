@@ -13,11 +13,17 @@ Usage:
     # Single GPU, flagos (FlagGems)
     python tests/test_qwen3_train.py --device flagos
 
+    # DDP with NCCL
+    torchrun --nproc_per_node=2 tests/test_qwen3_train.py --parallel ddp --comm nccl
+
     # DDP with FlagCX
     torchrun --nproc_per_node=2 tests/test_qwen3_train.py --parallel ddp --comm flagcx
 
     # FSDP with NCCL
     torchrun --nproc_per_node=2 tests/test_qwen3_train.py --parallel fsdp --comm nccl
+
+    # FSDP with FlagCX
+    torchrun --nproc_per_node=2 tests/test_qwen3_train.py --parallel fsdp --comm flagcx
 """
 
 import argparse
@@ -141,7 +147,6 @@ def load_model(args, device, rank):
 
     model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
     model = model.to(device)
-
     model.train()
 
     # Detect and freeze unused parameters
@@ -239,7 +244,6 @@ def wrap_fsdp(model, args, device, rank):
     print_rank0("\n[1.5b] Validating FSDP gradient flow...", rank)
     dummy_input = torch.randint(0, 1000, (1, 32), device=device)
     with torch.enable_grad():
-        # out = model(input_ids=dummy_input, attention_mask=None, labels=None, use_cache=False)
         out = model(input_ids=dummy_input, use_cache=False)
         out.logits.sum().backward()
 
