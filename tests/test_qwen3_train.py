@@ -147,8 +147,6 @@ def load_model(args, device, rank):
         flagos_dist.move_buffers_to_device(model, device)
 
     model.train()
-    for param in model.parameters():
-        param.requires_grad = True
 
     # Detect and freeze unused parameters
     print_rank0("\n[1.5] Detecting and freezing unused parameters...", rank)
