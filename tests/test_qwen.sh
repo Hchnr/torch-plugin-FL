@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-STEPS=${1:-3}
+STEPS=${1:-5}
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 LOG_DIR=${2:-$SCRIPT_DIR/logs/$(date +%Y%m%d_%H%M%S)}
 SCRIPT=tests/test_qwen3_train.py
@@ -35,9 +35,14 @@ echo "========================================"
 declare -a TASKS=(
     "cuda_single|1|python $SCRIPT --device cuda --steps $STEPS"
     "flagos_single|1|python $SCRIPT --device flagos --steps $STEPS"
-    "ddp_nccl|2|torchrun --nproc_per_node=2 --master_port=29501 $SCRIPT --parallel ddp --comm nccl --steps $STEPS"
-    "ddp_flagcx|2|torchrun --nproc_per_node=2 --master_port=29502 $SCRIPT --parallel ddp --comm flagcx --steps $STEPS"
-    "fsdp_flagcx|2|torchrun --nproc_per_node=2 --master_port=29503 $SCRIPT --parallel fsdp --comm flagcx --steps $STEPS"
+    "cuda_ddp_nccl|2|torchrun --nproc_per_node=2 --master_port=29500 $SCRIPT --device cuda --parallel ddp --comm nccl --steps $STEPS"
+    "cuda_ddp_flagcx|2|torchrun --nproc_per_node=2 --master_port=29501 $SCRIPT --device cuda --parallel ddp --comm flagcx --steps $STEPS"
+    "cuda_fsdp_nccl|2|torchrun --nproc_per_node=2 --master_port=29502 $SCRIPT --device cuda --parallel fsdp --comm nccl --steps $STEPS"
+    "cuda_fsdp_flagcx|2|torchrun --nproc_per_node=2 --master_port=29503 $SCRIPT --device cuda --parallel fsdp --comm flagcx --steps $STEPS"
+    "flagos_ddp_nccl|2|torchrun --nproc_per_node=2 --master_port=29504 $SCRIPT --device flagos --parallel ddp --comm nccl --steps $STEPS"
+    "flagos_ddp_flagcx|2|torchrun --nproc_per_node=2 --master_port=29505 $SCRIPT --device flagos --parallel ddp --comm flagcx --steps $STEPS"
+    "flagos_fsdp_nccl|2|torchrun --nproc_per_node=2 --master_port=29506 $SCRIPT --device flagos --parallel fsdp --comm nccl --steps $STEPS"
+    "flagos_fsdp_flagcx|2|torchrun --nproc_per_node=2 --master_port=29507 $SCRIPT --device flagos --parallel fsdp --comm flagcx --steps $STEPS"
 )
 
 # ---------------------------------------------------------------------------

@@ -105,13 +105,18 @@ NUM_GPUS=4 bash tests/test_qwen.sh
 
 The script runs the following test configurations in parallel (when GPUs are available):
 
-| Task | GPUs | Description |
-|------|------|-------------|
-| `cuda_single` | 1 | Single GPU, pure CUDA baseline |
-| `flagos_single` | 1 | Single GPU, flagos (FlagGems) |
-| `ddp_nccl` | 2 | DDP with NCCL backend |
-| `ddp_flagcx` | 2 | DDP with FlagCX backend |
-| `fsdp_flagcx` | 2 | FSDP with FlagCX backend |
+| Task | GPUs | Device | Parallel | Comm |
+|------|------|--------|----------|------|
+| `cuda_single` | 1 | CUDA | - | - |
+| `flagos_single` | 1 | flagos | - | - |
+| `cuda_ddp_nccl` | 2 | CUDA | DDP | NCCL |
+| `cuda_ddp_flagcx` | 2 | CUDA | DDP | FlagCX |
+| `cuda_fsdp_nccl` | 2 | CUDA | FSDP | NCCL |
+| `cuda_fsdp_flagcx` | 2 | CUDA | FSDP | FlagCX |
+| `flagos_ddp_nccl` | 2 | flagos | DDP | NCCL |
+| `flagos_ddp_flagcx` | 2 | flagos | DDP | FlagCX |
+| `flagos_fsdp_nccl` | 2 | flagos | FSDP | NCCL |
+| `flagos_fsdp_flagcx` | 2 | flagos | FSDP | FlagCX |
 
 Logs are saved to `tests/logs/<timestamp>/` with one file per task. The script prints a pass/fail summary at the end.
 
