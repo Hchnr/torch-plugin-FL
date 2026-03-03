@@ -13,11 +13,17 @@ Usage:
     # Single GPU, flagos (FlagGems)
     python tests/test_qwen3_train.py --device flagos
 
+    # DDP with NCCL
+    torchrun --nproc_per_node=2 tests/test_qwen3_train.py --parallel ddp --comm nccl
+
     # DDP with FlagCX
     torchrun --nproc_per_node=2 tests/test_qwen3_train.py --parallel ddp --comm flagcx
 
     # FSDP with NCCL
     torchrun --nproc_per_node=2 tests/test_qwen3_train.py --parallel fsdp --comm nccl
+
+    # FSDP with FlagCX
+    torchrun --nproc_per_node=2 tests/test_qwen3_train.py --parallel fsdp --comm flagcx
 """
 
 import argparse
@@ -51,30 +57,9 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-5)
     args = parser.parse_args()
-    # Default seq-len based on parallel mode
     if args.seq_len is None:
         args.seq_len = 256 if args.parallel != "none" else 1024
     return args
-
-
-# ---------------------------------------------------------------------------
-# Conditional imports (lazy)
-# ---------------------------------------------------------------------------
-
-_torch_flagos = None  # populated by _import_flagos()
-
-
-def _import_flagos():
-    global _torch_flagos
-    if _torch_flagos is None:
-        import torch_flagos
-        _torch_flagos = torch_flagos
-    return _torch_flagos
-
-
-def _import_flagcx():
-    import flagcx  # noqa: F401 — registers "flagcx" backend via torch.backends entry point
-    return flagcx
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +68,8 @@ def _import_flagcx():
 
 def sync(args):
     if args.device == "flagos":
-        _import_flagos().flagos.synchronize()
+        import torch_flagos
+        torch_flagos.flagos.synchronize()
     else:
         torch.cuda.synchronize()
 
@@ -91,58 +77,6 @@ def sync(args):
 def print_rank0(msg, rank):
     if rank == 0:
         print(msg)
-
-
-# ---------------------------------------------------------------------------
-# flagos-specific helpers
-# ---------------------------------------------------------------------------
-
-def move_buffers_to_device(module, device):
-    """Move all buffers to device (needed for flagos custom device)."""
-    for name, buf in module._buffers.items():
-        if buf is not None and buf.device.type != "privateuseone":
-            module._buffers[name] = buf.to(device)
-    for child in module.children():
-        move_buffers_to_device(child, device)
-
-
-def _patch_dist_collectives():
-    """Patch torch.distributed collectives to transparently handle flagos tensors."""
-    import torch_flagos._C as _C
-
-    def _ensure_cuda(tensor):
-        if tensor.device.type in ("privateuseone", "flagos"):
-            return _C._flagos_to_cuda_view(tensor)
-        return tensor
-
-    _orig_all_reduce = dist.all_reduce
-    def _all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
-        return _orig_all_reduce(_ensure_cuda(tensor), op=op, group=group, async_op=async_op)
-    dist.all_reduce = _all_reduce
-
-    _orig_broadcast = dist.broadcast
-    def _broadcast(tensor, src, group=None, async_op=False):
-        return _orig_broadcast(_ensure_cuda(tensor), src=src, group=group, async_op=async_op)
-    dist.broadcast = _broadcast
-
-    _orig_reduce = dist.reduce
-    def _reduce(tensor, dst, op=dist.ReduceOp.SUM, group=None, async_op=False):
-        return _orig_reduce(_ensure_cuda(tensor), dst=dst, op=op, group=group, async_op=async_op)
-    dist.reduce = _reduce
-
-    _orig_all_gather_into_tensor = dist.all_gather_into_tensor
-    def _all_gather_into_tensor(output, input, group=None, async_op=False):
-        return _orig_all_gather_into_tensor(
-            _ensure_cuda(output), _ensure_cuda(input), group=group, async_op=async_op,
-        )
-    dist.all_gather_into_tensor = _all_gather_into_tensor
-
-    _orig_reduce_scatter_tensor = dist.reduce_scatter_tensor
-    def _reduce_scatter_tensor(output, input, op=dist.ReduceOp.SUM, group=None, async_op=False):
-        return _orig_reduce_scatter_tensor(
-            _ensure_cuda(output), _ensure_cuda(input), op=op, group=group, async_op=async_op,
-        )
-    dist.reduce_scatter_tensor = _reduce_scatter_tensor
 
 
 # ---------------------------------------------------------------------------
@@ -158,32 +92,24 @@ def setup(args):
     rank = int(os.environ.get("RANK", 0))
 
     if args.device == "flagos":
-        tf = _import_flagos()
-        tf.flagos.set_device(local_rank)
+        import torch_flagos
+        torch_flagos.flagos.set_device(local_rank)
     torch.cuda.set_device(local_rank)
 
     if args.parallel == "none":
         return f"{args.device}:{local_rank}", local_rank, 1, 0
 
     # --- Distributed init ---
-    from torch.distributed.distributed_c10d import ProcessGroup
-
-    if args.comm == "flagcx":
-        _import_flagcx()
-        dist.init_process_group(backend="cpu:gloo,cuda:flagcx")
-    else:
-        dist.init_process_group(backend="nccl")
-
     if args.device == "flagos":
-        # Register the GPU backend for privateuseone so dist ops work on flagos tensors
-        pg = dist.distributed_c10d._get_default_group()
-        gpu_backend = pg._get_backend(torch.device("cuda"))
-        backend_type = (ProcessGroup.BackendType.CUSTOM if args.comm == "flagcx"
-                        else ProcessGroup.BackendType.NCCL)
-        pg._register_backend(torch.device("privateuseone"), backend_type, gpu_backend)
-        _patch_dist_collectives()
+        import torch_flagos.distributed as flagos_dist
+        flagos_dist.init_process_group(backend=args.comm)
+    else:
+        if args.comm == "flagcx":
+            import flagcx  # noqa: F401
+            dist.init_process_group(backend="cpu:gloo,cuda:flagcx")
+        else:
+            dist.init_process_group(backend="nccl")
 
-    # Debug info
     if rank == 0:
         pg = dist.distributed_c10d._get_default_group()
         print(f"[DEBUG] Backend config: {dist.get_backend_config()}", flush=True)
@@ -221,13 +147,7 @@ def load_model(args, device, rank):
 
     model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
     model = model.to(device)
-
-    if args.device == "flagos":
-        move_buffers_to_device(model, device)
-
     model.train()
-    for param in model.parameters():
-        param.requires_grad = True
 
     # Detect and freeze unused parameters
     print_rank0("\n[1.5] Detecting and freezing unused parameters...", rank)
@@ -266,44 +186,14 @@ def load_model(args, device, rank):
 
 def wrap_ddp(model, args, local_rank, rank):
     """Wrap model with DDP."""
-    from torch.nn.parallel import DistributedDataParallel as DDP
-
     if args.device == "flagos":
-        # flagos needs python_reducer mode because PyTorch's C++ Reducer
-        # uses CUDA Future which fails for privateuseone tensors.
-        import torch._dynamo.utils
-        _orig = torch._dynamo.utils.get_optimize_ddp_mode
-        torch._dynamo.utils.get_optimize_ddp_mode = lambda: "python_reducer"
-        try:
-            model = DDP(model, init_sync=False, broadcast_buffers=False, gradient_as_bucket_view=True)
-        finally:
-            torch._dynamo.utils.get_optimize_ddp_mode = _orig
-
-        # Replace default accum_grad_hooks with flagos-compatible version
-        for h in model._accum_grad_hooks:
-            h.remove()
-        model._accum_grad_hooks.clear()
-
-        def _accum_grad_hook(param, *, ddp_model):
-            if not ddp_model.require_backward_grad_sync:
-                return
-            if param.grad is None:
-                return
-            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-            param.grad.div_(dist.get_world_size())
-
-        for param in model._module_parameters:
-            if param.requires_grad:
-                model._accum_grad_hooks.append(
-                    param.register_post_accumulate_grad_hook(
-                        functools.partial(_accum_grad_hook, ddp_model=model)
-                    )
-                )
-        print_rank0("    DDP: python_reducer + custom grad hooks (flagos)", rank)
+        import torch_flagos.distributed as flagos_dist
+        model = flagos_dist.DistributedDataParallel(model)
+        print_rank0("    DDP: flagos mode (python_reducer + custom grad hooks)", rank)
     else:
+        from torch.nn.parallel import DistributedDataParallel as DDP
         model = DDP(model, device_ids=[local_rank])
         print_rank0("    DDP: standard mode (CUDA)", rank)
-
     return model
 
 
@@ -322,7 +212,6 @@ def wrap_fsdp(model, args, device, rank):
         size_based_auto_wrap_policy,
     )
 
-    # Determine wrap policy
     try:
         from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
         wrap_cls = Qwen3DecoderLayer
@@ -342,9 +231,6 @@ def wrap_fsdp(model, args, device, rank):
             size_based_auto_wrap_policy, min_num_params=1e6
         )
 
-    if args.device == "flagos":
-        move_buffers_to_device(model, device)
-
     model = FSDP(
         model,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
@@ -354,14 +240,11 @@ def wrap_fsdp(model, args, device, rank):
     )
     model.train()
 
-    if args.device == "flagos":
-        move_buffers_to_device(model, device)
-
     # Validate: detect unused parameters via dummy forward+backward
     print_rank0("\n[1.5b] Validating FSDP gradient flow...", rank)
     dummy_input = torch.randint(0, 1000, (1, 32), device=device)
     with torch.enable_grad():
-        out = model(input_ids=dummy_input, attention_mask=None, labels=None, use_cache=False)
+        out = model(input_ids=dummy_input, use_cache=False)
         out.logits.sum().backward()
 
     unused = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
@@ -402,37 +285,16 @@ def train_step(model, batch, device, args):
     Returns (loss, batch_tokens).
     """
     input_ids = batch["input_ids"].to(device)
+    attention_mask = batch["attention_mask"].to(device)
     labels = batch["labels"].to(device)
 
-    if args.device == "flagos":
-        # Skip attention_mask and labels to avoid transformers masking_utils
-        # device compatibility issues with custom devices.
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=None,
-            labels=None,
-            use_cache=False,
-        )
-        logits = outputs.logits
-        shift_logits = logits[..., :-1, :].reshape(-1, logits.size(-1))
-        shift_labels = labels[..., 1:].reshape(-1)
-        loss = torch.nn.functional.cross_entropy(shift_logits, shift_labels)
-    else:
-        attention_mask = batch["attention_mask"].to(device)
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-        )
-        if outputs.loss.requires_grad:
-            loss = outputs.loss
-        else:
-            logits = outputs.logits
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = torch.nn.functional.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-            )
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        labels=labels,
+        use_cache=False,
+    )
+    loss = outputs.loss
 
     return loss, input_ids.numel()
 
@@ -508,10 +370,10 @@ def main():
     print_rank0("=" * 60, rank)
 
     if args.device == "flagos":
-        tf = _import_flagos()
-        print_rank0(f"Flagos device available: {tf.flagos.is_available()}", rank)
-        print_rank0(f"FlagGems registered: {tf.is_flaggems_enabled()}", rank)
-        print_rank0(f"Registered ops count: {len(tf.get_registered_ops())}", rank)
+        import torch_flagos
+        print_rank0(f"Flagos device available: {torch_flagos.flagos.is_available()}", rank)
+        print_rank0(f"FlagGems registered: {torch_flagos.is_flaggems_enabled()}", rank)
+        print_rank0(f"Registered ops count: {len(torch_flagos.get_registered_ops())}", rank)
     else:
         print_rank0(f"CUDA available: {torch.cuda.is_available()}", rank)
         if torch.cuda.is_available():
@@ -526,7 +388,6 @@ def main():
     # --- Distributed barrier before wrapping ---
     if args.parallel != "none":
         sync(args)
-        # barrier via all_reduce
         t = torch.zeros(1, device=device)
         dist.all_reduce(t)
         sync(args)
