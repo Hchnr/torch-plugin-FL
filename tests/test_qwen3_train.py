@@ -94,7 +94,8 @@ def setup(args):
     if args.device == "flagos":
         import torch_flagos
         torch_flagos.flagos.set_device(local_rank)
-    torch.cuda.set_device(local_rank)
+    else:
+        torch.cuda.set_device(local_rank)
 
     if args.parallel == "none":
         return f"{args.device}:{local_rank}", local_rank, 1, 0
@@ -207,29 +208,12 @@ def wrap_fsdp(model, args, device, rank):
         FullyShardedDataParallel as FSDP,
         ShardingStrategy,
     )
-    from torch.distributed.fsdp.wrap import (
-        transformer_auto_wrap_policy,
-        size_based_auto_wrap_policy,
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+
+    auto_wrap_policy = functools.partial(
+        transformer_auto_wrap_policy, transformer_layer_cls={Qwen3DecoderLayer}
     )
-
-    try:
-        from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
-        wrap_cls = Qwen3DecoderLayer
-    except ImportError:
-        try:
-            from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
-            wrap_cls = Qwen2DecoderLayer
-        except ImportError:
-            wrap_cls = None
-
-    if wrap_cls is not None:
-        auto_wrap_policy = functools.partial(
-            transformer_auto_wrap_policy, transformer_layer_cls={wrap_cls}
-        )
-    else:
-        auto_wrap_policy = functools.partial(
-            size_based_auto_wrap_policy, min_num_params=1e6
-        )
 
     model = FSDP(
         model,
