@@ -134,6 +134,7 @@ def init_process_group(backend="nccl", **kwargs):
         dist.init_process_group(backend=backend, **kwargs)
 
     _register_privateuseone_backend(comm=backend)
+    # no need for FlagCX, but NCCL needs
     _patch_dist_collectives()
 
 
