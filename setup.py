@@ -14,6 +14,9 @@ from setuptools import Extension, find_packages, setup
 IS_DARWIN = platform.system() == "Darwin"
 IS_WINDOWS = platform.system() == "Windows"
 
+# GPU platform: "nvidia" (default) or "muxi"
+GPU_PLATFORM = os.environ.get("GPU_PLATFORM", "nvidia").lower()
+
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 
 # Only run cmake build for actual build commands, not metadata collection
@@ -47,10 +50,22 @@ def build_deps():
         "-DPYTORCH_INSTALL_DIR=" + get_pytorch_dir(),
     ]
 
-    # Add CUDA toolkit path if available
-    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
-    if cuda_home:
-        cmake_args.append(f"-DCMAKE_CUDA_COMPILER={cuda_home}/bin/nvcc")
+    cmake_args.append(f"-DGPU_PLATFORM={GPU_PLATFORM}")
+
+    if GPU_PLATFORM == "muxi":
+        # Muxi MACA SDK: no nvcc needed. CMakeLists.txt pre-creates
+        # torch::cudart to skip PyTorch's cuda.cmake entirely.
+        maca_path = (
+            os.environ.get("MACA_PATH")
+            or os.environ.get("MACA_HOME")
+            or "/opt/maca"
+        )
+        cmake_args.append(f"-DMACA_PATH={maca_path}")
+    else:
+        # Add CUDA toolkit path if available
+        cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+        if cuda_home:
+            cmake_args.append(f"-DCMAKE_CUDA_COMPILER={cuda_home}/bin/nvcc")
 
     subprocess.check_call(
         ["cmake", BASE_DIR] + cmake_args, cwd=build_dir, env=os.environ
