@@ -24,7 +24,7 @@ import ctypes
 import os
 import warnings
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Union
 
 import torch
 
@@ -180,11 +180,6 @@ def patch_torch_cuda_for_maca():
     if hasattr(torch.cuda, '_queued_calls'):
         torch.cuda._queued_calls.clear()
 
-    # Save originals
-    _orig_get_device_properties = torch.cuda.get_device_properties
-    _orig_get_device_name = torch.cuda.get_device_name
-    _orig_get_device_capability = torch.cuda.get_device_capability
-
     def _patched_get_device_properties(
         device: Union[torch.device, int, str, None] = None
     ):
@@ -232,10 +227,7 @@ def patch_torch_cuda_for_maca():
     return True
 
 
-# cudaMemcpyKind enum values
 _cudaMemcpyHostToDevice = 1
-_cudaMemcpyDeviceToHost = 2
-_cudaMemcpyDeviceToDevice = 3
 
 # Cached cudart handle
 _cudart = None
@@ -262,9 +254,8 @@ def _patch_cuda_tensor_ops(maca_path):
     NVIDIA-specific CUDA kernels.
 
     Patched operations:
-    - Tensor.zero_(): uses cudaMemsetAsync
-    - Tensor.fill_(scalar): uses cudaMemsetAsync for 0, kernel for others
-    - torch.cuda copy_: uses cudaMemcpyAsync
+    - Tensor.zero_(): uses cudaMemsetAsync (contiguous only)
+    - Tensor.fill_(scalar): uses cudaMemsetAsync for 0, cudaMemcpy for others (contiguous only)
     """
     cudart = _get_cudart()
     if cudart is None:
@@ -290,6 +281,17 @@ def _patch_cuda_tensor_ops(maca_path):
     cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
     cudaStreamSynchronize.restype = ctypes.c_int
 
+    def _maca_copy_to_cuda(dst, src):
+        """Copy src (CPU, contiguous) into dst (CUDA, contiguous) via cudaMemcpyAsync."""
+        nbytes = src.nelement() * src.element_size()
+        ret = cudaMemcpyAsync(
+            dst.data_ptr(), src.data_ptr(), nbytes,
+            _cudaMemcpyHostToDevice, None
+        )
+        if ret != 0:
+            warnings.warn(f"cudaMemcpyAsync failed with error {ret}")
+        cudaStreamSynchronize(None)
+
     _orig_zero = torch.Tensor.zero_
 
     def _maca_zero_(self):
@@ -297,22 +299,20 @@ def _patch_cuda_tensor_ops(maca_path):
         if not self.is_cuda:
             return _orig_zero(self)
         if not self.is_contiguous():
-            # For non-contiguous tensors, fill element by element via CPU
-            cpu_zeros = torch.zeros_like(self, device='cpu')
-            self.copy_(cpu_zeros)
-            return self
+            raise NotImplementedError(
+                "MACA compat: zero_() on non-contiguous CUDA tensors is not supported. "
+                "Call .contiguous() first."
+            )
         ptr = self.data_ptr()
         nbytes = self.nelement() * self.element_size()
         ret = cudaMemsetAsync(ptr, 0, nbytes, None)
         if ret != 0:
-            # Fallback: zero via CPU
             cpu_zeros = torch.zeros(self.shape, dtype=self.dtype, device='cpu')
-            self.copy_(cpu_zeros)
+            _maca_copy_to_cuda(self, cpu_zeros)
         return self
 
     torch.Tensor.zero_ = _maca_zero_
 
-    # Patch fill_() for CUDA tensors
     _orig_fill = torch.Tensor.fill_
 
     def _maca_fill_(self, value):
@@ -321,37 +321,14 @@ def _patch_cuda_tensor_ops(maca_path):
             return _orig_fill(self, value)
         if value == 0 and self.is_contiguous():
             return _maca_zero_(self)
-        # For non-zero fill, create on CPU and copy
+        # Create on CPU and copy to CUDA
         cpu_t = torch.full(self.shape, value, dtype=self.dtype, device='cpu')
-        _maca_copy_cuda(self, cpu_t)
+        if not self.is_contiguous():
+            raise NotImplementedError(
+                "MACA compat: fill_() on non-contiguous CUDA tensors is not supported. "
+                "Call .contiguous() first."
+            )
+        _maca_copy_to_cuda(self, cpu_t)
         return self
 
     torch.Tensor.fill_ = _maca_fill_
-
-    def _maca_copy_cuda(dst, src):
-        """Copy between CUDA<->CPU tensors using cudaMemcpy."""
-        if not dst.is_contiguous():
-            dst = dst.contiguous()
-        if not src.is_contiguous():
-            src = src.contiguous()
-
-        nbytes = src.nelement() * src.element_size()
-        src_ptr = src.data_ptr()
-        dst_ptr = dst.data_ptr()
-
-        if src.is_cuda and not dst.is_cuda:
-            kind = _cudaMemcpyDeviceToHost
-        elif not src.is_cuda and dst.is_cuda:
-            kind = _cudaMemcpyHostToDevice
-        elif src.is_cuda and dst.is_cuda:
-            kind = _cudaMemcpyDeviceToDevice
-        else:
-            # Both CPU, shouldn't happen
-            dst.copy_(src)
-            return
-
-        ret = cudaMemcpyAsync(dst_ptr, src_ptr, nbytes, kind, None)
-        if ret != 0:
-            warnings.warn(f"cudaMemcpyAsync failed with error {ret}")
-        # Synchronize to ensure copy is complete
-        cudaStreamSynchronize(None)
