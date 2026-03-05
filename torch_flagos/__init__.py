@@ -10,6 +10,17 @@ if sys.platform == "win32":
     del _load_dll_libraries
 
 
+# Apply MACA compatibility patches before importing FlagGems.
+# On MetaX (Muxi) hardware, PyTorch's bundled CUDA 12.x runtime is
+# ABI-incompatible with MACA's cu-bridge (CUDA 11.6). This patches
+# torch.cuda.get_device_properties/get_device_name to use MACA's
+# native mcruntime API, allowing FlagGems initialization to succeed.
+from torch_flagos._maca_compat import is_maca_available, patch_torch_cuda_for_maca
+
+if is_maca_available():
+    patch_torch_cuda_for_maca()
+
+
 import torch_flagos._C  # type: ignore[misc]
 import torch_flagos.flagos
 
