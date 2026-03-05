@@ -143,8 +143,7 @@ def load_model(args, device, rank):
         tokenizer.pad_token = tokenizer.eos_token
 
     load_kwargs = dict(torch_dtype=torch.float32, device_map="cpu")
-    if args.device == "flagos":
-        load_kwargs["attn_implementation"] = "eager"
+    load_kwargs["attn_implementation"] = "eager"
 
     model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
     model = model.to(device)

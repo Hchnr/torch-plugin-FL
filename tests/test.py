@@ -1,3 +1,5 @@
+# LD_PRELOAD=/opt/maca-3.3.0/lib/libsymbol_cu.so LD_LIBRARY_PATH=/opt/maca-3.3.0/tools/cu-bridge/lib:/opt/maca-3.3.0/lib:$LD_LIBRARY_PATH python tests/test.py
+
 import torch
 import torch_flagos  # Automatically registers FlagGems operators for "flagos" device
 
