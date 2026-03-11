@@ -24,6 +24,45 @@ BUILD_COMMANDS = {"build", "build_ext", "install", "develop", "bdist_wheel", "bd
 RUN_BUILD_DEPS = any(arg in BUILD_COMMANDS for arg in sys.argv)
 
 
+def _ensure_maca_cudart_shim():
+    """On MACA, compile and load a complete cudart shim before importing torch.
+
+    MACA's libsymbol_cu.so provides CUDA runtime symbols but without the
+    @@libcudart.so.12 version tags that PyTorch's .so files require.
+    We build a single shared library (csrc/cudart_shim.c) that:
+      1. Forwards ~79 symbols to libsymbol_cu.so via dlsym
+      2. Stubs ~11 symbols for APIs missing from MACA entirely
+      3. Tags ALL exported symbols with @@libcudart.so.12 via a version script
+    """
+    import ctypes
+
+    csrc = os.path.join(BASE_DIR, "csrc")
+    build_dir = os.path.join(BASE_DIR, "build")
+    os.makedirs(build_dir, exist_ok=True)
+
+    shim_so = os.path.join(build_dir, "libcudart_shim.so")
+    shim_src = os.path.join(csrc, "cudart_shim.c")
+    version_script = os.path.join(csrc, "libcudart.version")
+
+    inputs = [shim_src, version_script]
+    if not os.path.exists(shim_so) or any(
+        os.path.exists(s) and os.path.getmtime(s) > os.path.getmtime(shim_so)
+        for s in inputs
+    ):
+        subprocess.check_call([
+            "gcc", "-shared", "-fPIC", "-o", shim_so, shim_src,
+            f"-Wl,--version-script={version_script}",
+            "-Wl,-soname,libcudart.so.12",
+            "-ldl",
+        ])
+
+    ctypes.CDLL(shim_so, mode=ctypes.RTLD_GLOBAL)
+
+
+if GPU_PLATFORM == "muxi":
+    _ensure_maca_cudart_shim()
+
+
 def make_relative_rpath_args(path):
     if IS_DARWIN:
         return ["-Wl,-rpath,@loader_path/" + path]
