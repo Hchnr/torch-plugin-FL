@@ -2,8 +2,8 @@
 Qwen3 Inference Test - Using torch_flagos
 """
 
+import torch_flagos  # Must be imported before torch on MACA (loads cudart shim)
 import torch
-import torch_flagos  # Automatically registers FlagGems operators to flagos device
 import time
 
 print("=" * 60)

@@ -1,5 +1,8 @@
 import sys
 
+from torch_flagos._maca_cudart_shim import ensure_cudart_shim
+ensure_cudart_shim()
+
 import torch
 
 
