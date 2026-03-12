@@ -84,6 +84,9 @@ _EXCLUDED_OPS = {
     "exponential_", "multinomial",
     # Copy ops - already registered in C++, skip to avoid duplicate registration
     "copy_", "_to_copy", "contiguous", "clone",
+    # log_softmax - FlagGems Triton kernel exceeds MACA's 4KB/thread private memory
+    # limit on large vocab (e.g. Qwen3 151k). Use Python decomposition instead.
+    "_log_softmax", "_log_softmax_backward_data",
 }
 
 
@@ -197,6 +200,23 @@ def _register_composite_ops():
         return torch.slice_scatter(grad_input, grad_output, dim, start, end, step)
 
     lib.impl("slice_backward", slice_backward_impl, "PrivateUse1")
+
+    # log_softmax: decompose into softmax + log to avoid FlagGems Triton kernel
+    # that exceeds MACA's 4KB/thread private memory on large vocab dimensions.
+    # The softmax kernel already has proper tiling for large N.
+    def log_softmax_impl(self, dim, half_to_float=False):
+        dtype = torch.float32 if half_to_float else self.dtype
+        out = torch.softmax(self.to(torch.float32), dim=dim)
+        out = torch.log(out)
+        return out.to(dtype)
+
+    def log_softmax_backward_impl(grad_output, output, dim, input_dtype):
+        exp_output = torch.exp(output)
+        grad_input = grad_output - exp_output * grad_output.sum(dim=dim, keepdim=True)
+        return grad_input.to(input_dtype)
+
+    lib.impl("_log_softmax", log_softmax_impl, "PrivateUse1")
+    lib.impl("_log_softmax_backward_data", log_softmax_backward_impl, "PrivateUse1")
 
     return lib  # prevent GC
 

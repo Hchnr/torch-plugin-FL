@@ -31,6 +31,7 @@ import functools
 import os
 import time
 
+import torch_flagos
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
