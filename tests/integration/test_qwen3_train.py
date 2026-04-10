@@ -22,24 +22,6 @@ from dummy_dataset import DummyTextDataset
 from torch.utils.data import DataLoader
 
 
-def pytest_addoption(parser):
-    parser.addoption("--device", default="cuda", choices=["cuda", "flagos"])
-    parser.addoption("--model", default="/nfs/hcr/models/Qwen/Qwen3-0.6B")
-    parser.addoption("--steps", type=int, default=10)
-    parser.addoption("--batch-size", type=int, default=2)
-    parser.addoption("--seq-len", type=int, default=1024)
-    parser.addoption("--lr", type=float, default=1e-5)
-
-
-def pytest_configure(config):
-    dev = config.getoption("--device", default="cuda")
-    if dev == "flagos":
-        import torch_flagos  # noqa: F401
-        if not torch_flagos.flagos.is_available():
-            pytest.exit("flagos device is not available.")
-    else:
-        if not torch.cuda.is_available():
-            pytest.exit("CUDA is not available.")
 
 
 def sync(dev):

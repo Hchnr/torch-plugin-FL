@@ -15,9 +15,6 @@ import pytest
 import torch
 
 
-def pytest_addoption(parser):
-    parser.addoption("--device", default="cuda", help="Device to run tests on (cuda or flagos)")
-
 
 @pytest.fixture(scope="session")
 def device(request):

@@ -13,23 +13,6 @@ import pytest
 import torch
 
 
-def pytest_addoption(parser):
-    parser.addoption("--device", default="cuda", choices=["cuda", "flagos"])
-    parser.addoption("--model", default="/nfs/hcr/models/Qwen/Qwen3-0.6B")
-    parser.addoption("--max-new-tokens", type=int, default=128)
-
-
-def pytest_configure(config):
-    dev = config.getoption("--device", default="cuda")
-    if dev == "flagos":
-        import torch_flagos  # noqa: F401 — must be imported before torch on MACA
-        if not torch_flagos.flagos.is_available():
-            pytest.exit("flagos device is not available.")
-    else:
-        if not torch.cuda.is_available():
-            pytest.exit("CUDA is not available.")
-
-
 @pytest.fixture(scope="module")
 def ctx(request):
     dev = request.config.getoption("--device")
