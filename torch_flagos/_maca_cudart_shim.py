@@ -21,10 +21,7 @@ def ensure_cudart_shim():
         return
 
     # Detect MACA environment
-    maca_path = (
-        os.environ.get("MACA_PATH")
-        or os.environ.get("MACA_HOME")
-    )
+    maca_path = os.environ.get("MACA_PATH") or os.environ.get("MACA_HOME")
     if not maca_path:
         for candidate in ["/opt/maca", "/opt/maca-3.3.0"]:
             if os.path.isdir(candidate):
@@ -33,9 +30,7 @@ def ensure_cudart_shim():
     if not maca_path or not os.path.isdir(maca_path):
         return  # Not a MACA environment
 
-    pkg_dir = os.path.dirname(
-        os.path.abspath(__file__)
-    )
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
     base_dir = os.path.dirname(pkg_dir)
     csrc = os.path.join(base_dir, "csrc")
     build_dir = os.path.join(base_dir, "build")
@@ -53,16 +48,22 @@ def ensure_cudart_shim():
     # Rebuild if source is newer
     inputs = [shim_src, version_script]
     if not os.path.exists(shim_so) or any(
-        os.path.exists(s)
-        and os.path.getmtime(s) > os.path.getmtime(shim_so)
+        os.path.exists(s) and os.path.getmtime(s) > os.path.getmtime(shim_so)
         for s in inputs
     ):
-        subprocess.check_call([
-            "gcc", "-shared", "-fPIC", "-o", shim_so, shim_src,
-            f"-Wl,--version-script={version_script}",
-            "-Wl,-soname,libcudart.so.12",
-            "-ldl",
-        ])
+        subprocess.check_call(
+            [
+                "gcc",
+                "-shared",
+                "-fPIC",
+                "-o",
+                shim_so,
+                shim_src,
+                f"-Wl,--version-script={version_script}",
+                "-Wl,-soname,libcudart.so.12",
+                "-ldl",
+            ]
+        )
 
     ctypes.CDLL(shim_so, mode=ctypes.RTLD_GLOBAL)
     _loaded = True

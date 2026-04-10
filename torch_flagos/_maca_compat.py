@@ -55,6 +55,7 @@ def _load_mcruntime(maca_path):
 @dataclass
 class _MacaDeviceProperties:
     """Minimal device properties matching torch.cuda._CudaDeviceProperties interface."""
+
     name: str = ""
     major: int = 0
     minor: int = 0
@@ -89,7 +90,9 @@ def _query_maca_device_properties(mcruntime, device_index):
     # mcDeviceGetAttribute(int *value, int attr, int device)
     mcDeviceGetAttribute = mcruntime.mcDeviceGetAttribute
     mcDeviceGetAttribute.argtypes = [
-        ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_int,
+        ctypes.c_int,
     ]
     mcDeviceGetAttribute.restype = ctypes.c_int
 
@@ -123,7 +126,8 @@ def _query_maca_device_properties(mcruntime, device_index):
     total_mem = ctypes.c_size_t(0)
     mcMemGetInfo = mcruntime.mcMemGetInfo
     mcMemGetInfo.argtypes = [
-        ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
     ]
     mcMemGetInfo.restype = ctypes.c_int
     ret = mcMemGetInfo(ctypes.byref(free_mem), ctypes.byref(total_mem))
@@ -177,11 +181,11 @@ def patch_torch_cuda_for_maca():
 
     # Skip PyTorch's CUDA capability check (it fails because MACA reports
     # CUDA 11.6 but PyTorch expects CUDA 12.0+ runtime)
-    if hasattr(torch.cuda, '_queued_calls'):
+    if hasattr(torch.cuda, "_queued_calls"):
         torch.cuda._queued_calls.clear()
 
     def _patched_get_device_properties(
-        device: Union[torch.device, int, str, None] = None
+        device: Union[torch.device, int, str, None] = None,
     ):
         """Get device properties from MACA native API."""
         if device is None:
@@ -200,14 +204,14 @@ def patch_torch_cuda_for_maca():
         return _maca_props_cache[device_index]
 
     def _patched_get_device_name(
-        device: Union[torch.device, int, str, None] = None
+        device: Union[torch.device, int, str, None] = None,
     ) -> str:
         """Get device name from MACA native API."""
         props = _patched_get_device_properties(device)
         return props.name
 
     def _patched_get_device_capability(
-        device: Union[torch.device, int, str, None] = None
+        device: Union[torch.device, int, str, None] = None,
     ):
         """Get device capability from MACA (returns sensible defaults)."""
         props = _patched_get_device_properties(device)
@@ -264,15 +268,21 @@ def _patch_cuda_tensor_ops(maca_path):
     # Setup cudaMemsetAsync
     cudaMemsetAsync = cudart.cudaMemsetAsync
     cudaMemsetAsync.argtypes = [
-        ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t, ctypes.c_void_p
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
     ]
     cudaMemsetAsync.restype = ctypes.c_int
 
     # Setup cudaMemcpyAsync
     cudaMemcpyAsync = cudart.cudaMemcpyAsync
     cudaMemcpyAsync.argtypes = [
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
-        ctypes.c_int, ctypes.c_void_p
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_void_p,
     ]
     cudaMemcpyAsync.restype = ctypes.c_int
 
@@ -285,8 +295,7 @@ def _patch_cuda_tensor_ops(maca_path):
         """Copy src (CPU, contiguous) into dst (CUDA, contiguous) via cudaMemcpyAsync."""
         nbytes = src.nelement() * src.element_size()
         ret = cudaMemcpyAsync(
-            dst.data_ptr(), src.data_ptr(), nbytes,
-            _cudaMemcpyHostToDevice, None
+            dst.data_ptr(), src.data_ptr(), nbytes, _cudaMemcpyHostToDevice, None
         )
         if ret != 0:
             warnings.warn(f"cudaMemcpyAsync failed with error {ret}")
@@ -307,7 +316,7 @@ def _patch_cuda_tensor_ops(maca_path):
         nbytes = self.nelement() * self.element_size()
         ret = cudaMemsetAsync(ptr, 0, nbytes, None)
         if ret != 0:
-            cpu_zeros = torch.zeros(self.shape, dtype=self.dtype, device='cpu')
+            cpu_zeros = torch.zeros(self.shape, dtype=self.dtype, device="cpu")
             _maca_copy_to_cuda(self, cpu_zeros)
         return self
 
@@ -322,7 +331,7 @@ def _patch_cuda_tensor_ops(maca_path):
         if value == 0 and self.is_contiguous():
             return _maca_zero_(self)
         # Create on CPU and copy to CUDA
-        cpu_t = torch.full(self.shape, value, dtype=self.dtype, device='cpu')
+        cpu_t = torch.full(self.shape, value, dtype=self.dtype, device="cpu")
         if not self.is_contiguous():
             raise NotImplementedError(
                 "MACA compat: fill_() on non-contiguous CUDA tensors is not supported. "

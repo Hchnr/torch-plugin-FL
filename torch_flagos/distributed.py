@@ -50,43 +50,72 @@ def _patch_dist_collectives():
     import torch_flagos._C as _C
 
     def _ensure_cuda(tensor):
-        if isinstance(tensor, torch.Tensor) and tensor.device.type in ("privateuseone", "flagos"):
+        if isinstance(tensor, torch.Tensor) and tensor.device.type in (
+            "privateuseone",
+            "flagos",
+        ):
             return _C._flagos_to_cuda_view(tensor)
         return tensor
 
     _orig_all_reduce = dist.all_reduce
+
     def _all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
-        return _orig_all_reduce(_ensure_cuda(tensor), op=op, group=group, async_op=async_op)
+        return _orig_all_reduce(
+            _ensure_cuda(tensor), op=op, group=group, async_op=async_op
+        )
+
     dist.all_reduce = _all_reduce
 
     _orig_broadcast = dist.broadcast
+
     def _broadcast(tensor, src, group=None, async_op=False):
-        return _orig_broadcast(_ensure_cuda(tensor), src=src, group=group, async_op=async_op)
+        return _orig_broadcast(
+            _ensure_cuda(tensor), src=src, group=group, async_op=async_op
+        )
+
     dist.broadcast = _broadcast
 
     _orig_reduce = dist.reduce
+
     def _reduce(tensor, dst, op=dist.ReduceOp.SUM, group=None, async_op=False):
-        return _orig_reduce(_ensure_cuda(tensor), dst=dst, op=op, group=group, async_op=async_op)
+        return _orig_reduce(
+            _ensure_cuda(tensor), dst=dst, op=op, group=group, async_op=async_op
+        )
+
     dist.reduce = _reduce
 
     _orig_all_gather_into_tensor = dist.all_gather_into_tensor
+
     def _all_gather_into_tensor(output, input, group=None, async_op=False):
         return _orig_all_gather_into_tensor(
-            _ensure_cuda(output), _ensure_cuda(input), group=group, async_op=async_op,
+            _ensure_cuda(output),
+            _ensure_cuda(input),
+            group=group,
+            async_op=async_op,
         )
+
     dist.all_gather_into_tensor = _all_gather_into_tensor
 
     _orig_reduce_scatter_tensor = dist.reduce_scatter_tensor
-    def _reduce_scatter_tensor(output, input, op=dist.ReduceOp.SUM, group=None, async_op=False):
+
+    def _reduce_scatter_tensor(
+        output, input, op=dist.ReduceOp.SUM, group=None, async_op=False
+    ):
         return _orig_reduce_scatter_tensor(
-            _ensure_cuda(output), _ensure_cuda(input), op=op, group=group, async_op=async_op,
+            _ensure_cuda(output),
+            _ensure_cuda(input),
+            op=op,
+            group=group,
+            async_op=async_op,
         )
+
     dist.reduce_scatter_tensor = _reduce_scatter_tensor
 
 
 # ---------------------------------------------------------------------------
 # Internal: register GPU backend for privateuseone device type
 # ---------------------------------------------------------------------------
+
 
 def _register_privateuseone_backend(comm):
     """Register the GPU communication backend for the privateuseone device type.
@@ -103,7 +132,8 @@ def _register_privateuseone_backend(comm):
     pg = dist.distributed_c10d._get_default_group()
     gpu_backend = pg._get_backend(torch.device("cuda"))
     backend_type = (
-        ProcessGroup.BackendType.CUSTOM if comm == "flagcx"
+        ProcessGroup.BackendType.CUSTOM
+        if comm == "flagcx"
         else ProcessGroup.BackendType.NCCL
     )
     pg._register_backend(torch.device("privateuseone"), backend_type, gpu_backend)
@@ -112,6 +142,7 @@ def _register_privateuseone_backend(comm):
 # ---------------------------------------------------------------------------
 # Public API: init_process_group
 # ---------------------------------------------------------------------------
+
 
 def init_process_group(backend="nccl", **kwargs):
     """Initialize distributed process group for flagos device.
@@ -129,6 +160,7 @@ def init_process_group(backend="nccl", **kwargs):
     """
     if backend == "flagcx":
         import flagcx  # noqa: F401 — registers "flagcx" via torch.backends entry point
+
         dist.init_process_group(backend="cpu:gloo,cuda:flagcx", **kwargs)
     else:
         dist.init_process_group(backend=backend, **kwargs)
@@ -141,6 +173,7 @@ def init_process_group(backend="nccl", **kwargs):
 # ---------------------------------------------------------------------------
 # Public API: DistributedDataParallel
 # ---------------------------------------------------------------------------
+
 
 class DistributedDataParallel(_DDP):
     """DDP wrapper for flagos models.
@@ -158,6 +191,7 @@ class DistributedDataParallel(_DDP):
     def __init__(self, module, **kwargs):
         # Force python_reducer mode to avoid C++ CUDA Future validation
         import torch._dynamo.utils
+
         _orig = torch._dynamo.utils.get_optimize_ddp_mode
         torch._dynamo.utils.get_optimize_ddp_mode = lambda: "python_reducer"
         try:
@@ -194,6 +228,7 @@ class DistributedDataParallel(_DDP):
 # ---------------------------------------------------------------------------
 # Public API: move_buffers_to_device
 # ---------------------------------------------------------------------------
+
 
 def move_buffers_to_device(module, device):
     """Recursively move all module buffers to the specified device.

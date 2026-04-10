@@ -39,7 +39,10 @@ print(f"Model load time: {time.time() - load_start:.2f}s")
 prompt = "Give me a short introduction to large language model."
 messages = [{"role": "user", "content": prompt}]
 text = tokenizer.apply_chat_template(
-    messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
+    messages,
+    tokenize=False,
+    add_generation_prompt=True,
+    enable_thinking=False,
 )
 model_inputs = tokenizer([text], return_tensors="pt").to(DEVICE)
 input_len = model_inputs.input_ids.shape[1]
@@ -59,7 +62,7 @@ run_labels = [
     "Fourth",
 ]
 for i in range(4):
-    print(f"\n[{i+2}] {run_labels[i]} (max_new_tokens={MAX_NEW_TOKENS})...")
+    print(f"\n[{i + 2}] {run_labels[i]} (max_new_tokens={MAX_NEW_TOKENS})...")
     if i == 0:
         print("    (First run will trigger Triton kernel compilation, may take longer)")
     sync()
@@ -71,12 +74,14 @@ for i in range(4):
     new_tokens = output.shape[1] - input_len
     times.append(elapsed)
     token_counts.append(new_tokens)
-    print(f"{run_labels[i]}: {elapsed:.2f}s, {new_tokens} tokens, {new_tokens/elapsed:.2f} tokens/s")
+    print(
+        f"{run_labels[i]}: {elapsed:.2f}s, {new_tokens} tokens, {new_tokens / elapsed:.2f} tokens/s"
+    )
 
 print("\n" + "=" * 60)
 print("Summary (torch_flagos + FlagGems):")
 for label, t, tc in zip(run_labels, times, token_counts):
-    print(f"  {label}: {t:.2f}s ({tc/t:.2f} tokens/s)")
+    print(f"  {label}: {t:.2f}s ({tc / t:.2f} tokens/s)")
 avg_t = sum(times[1:]) / 3
 avg_tps = sum(token_counts[1:]) / sum(times[1:])
 print(f"  Average (runs 2-4): {avg_t:.2f}s ({avg_tps:.2f} tokens/s)")

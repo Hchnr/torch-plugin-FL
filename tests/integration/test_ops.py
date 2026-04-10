@@ -15,27 +15,32 @@ import pytest
 import torch
 
 
-
 @pytest.fixture(scope="session")
 def device(request):
     dev = request.config.getoption("--device")
     if dev == "flagos":
         import torch_flagos  # noqa: F401 — must be imported before torch on MACA
+
         if not torch_flagos.flagos.is_available():
             pytest.exit("flagos device is not available.")
-        print(f"\nflagos device count={torch_flagos.flagos.device_count()}  "
-              f"FlagGems enabled={torch_flagos.is_flaggems_enabled()}  "
-              f"registered ops={len(torch_flagos.get_registered_ops())}")
+        print(
+            f"\nflagos device count={torch_flagos.flagos.device_count()}  "
+            f"FlagGems enabled={torch_flagos.is_flaggems_enabled()}  "
+            f"registered ops={len(torch_flagos.get_registered_ops())}"
+        )
     else:
         if not torch.cuda.is_available():
             pytest.exit("CUDA is not available.")
-        print(f"\nCUDA device: {torch.cuda.get_device_name(0)}  count={torch.cuda.device_count()}")
+        print(
+            f"\nCUDA device: {torch.cuda.get_device_name(0)}  count={torch.cuda.device_count()}"
+        )
     return f"{dev}:0"
 
 
 # ---------------------------------------------------------------------------
 # 1. Tensor creation
 # ---------------------------------------------------------------------------
+
 
 class TestTensorCreation:
     def test_randn(self, device):
@@ -52,28 +57,31 @@ class TestTensorCreation:
         assert torch.arange(10, device=device)[-1].item() == 9
 
     def test_full(self, device):
-        assert torch.full((4, 4), 3.14, device=device)[0, 0].item() == pytest.approx(3.14)
+        assert torch.full((4, 4), 3.14, device=device)[0, 0].item() == pytest.approx(
+            3.14
+        )
 
 
 # ---------------------------------------------------------------------------
 # 2. Arithmetic operations
 # ---------------------------------------------------------------------------
 
+
 class TestArithmetic:
     def test_add(self, device):
         a = torch.tensor([1.0, 2.0, 3.0], device=device)
         b = torch.tensor([4.0, 5.0, 6.0], device=device)
-        assert torch.allclose(a + b, torch.tensor([5., 7., 9.], device=device))
+        assert torch.allclose(a + b, torch.tensor([5.0, 7.0, 9.0], device=device))
 
     def test_sub(self, device):
         a = torch.tensor([1.0, 2.0, 3.0], device=device)
         b = torch.tensor([4.0, 5.0, 6.0], device=device)
-        assert torch.allclose(a - b, torch.tensor([-3., -3., -3.], device=device))
+        assert torch.allclose(a - b, torch.tensor([-3.0, -3.0, -3.0], device=device))
 
     def test_mul(self, device):
         a = torch.tensor([1.0, 2.0, 3.0], device=device)
         b = torch.tensor([4.0, 5.0, 6.0], device=device)
-        assert torch.allclose(a * b, torch.tensor([4., 10., 18.], device=device))
+        assert torch.allclose(a * b, torch.tensor([4.0, 10.0, 18.0], device=device))
 
     def test_div(self, device):
         a = torch.tensor([1.0, 2.0, 3.0], device=device)
@@ -82,16 +90,20 @@ class TestArithmetic:
 
     def test_neg(self, device):
         a = torch.tensor([1.0, 2.0, 3.0], device=device)
-        assert torch.allclose(-a, torch.tensor([-1., -2., -3.], device=device))
+        assert torch.allclose(-a, torch.tensor([-1.0, -2.0, -3.0], device=device))
 
 
 # ---------------------------------------------------------------------------
 # 3. Matrix operations
 # ---------------------------------------------------------------------------
 
+
 class TestMatrixOps:
     def test_mm(self, device):
-        m, n = torch.randn(256, 256, device=device), torch.randn(256, 256, device=device)
+        m, n = (
+            torch.randn(256, 256, device=device),
+            torch.randn(256, 256, device=device),
+        )
         result = torch.mm(m, n)
         assert result.shape == (256, 256)
         assert result.device.type == device.split(":")[0]
@@ -102,13 +114,17 @@ class TestMatrixOps:
         assert torch.bmm(a, b).shape == (8, 64, 64)
 
     def test_matmul(self, device):
-        m, n = torch.randn(256, 256, device=device), torch.randn(256, 256, device=device)
+        m, n = (
+            torch.randn(256, 256, device=device),
+            torch.randn(256, 256, device=device),
+        )
         assert torch.matmul(m, n).shape == (256, 256)
 
 
 # ---------------------------------------------------------------------------
 # 4. Reduction operations
 # ---------------------------------------------------------------------------
+
 
 class TestReductions:
     def test_sum(self, device):
@@ -134,9 +150,13 @@ class TestReductions:
 # 5. Activation functions
 # ---------------------------------------------------------------------------
 
+
 class TestActivations:
     def test_relu(self, device):
-        assert torch.nn.functional.relu(torch.randn(64, 64, device=device)).min().item() >= 0.0
+        assert (
+            torch.nn.functional.relu(torch.randn(64, 64, device=device)).min().item()
+            >= 0.0
+        )
 
     def test_sigmoid(self, device):
         s = torch.sigmoid(torch.randn(64, 64, device=device))
@@ -151,7 +171,9 @@ class TestActivations:
         assert torch.allclose(sm.sum(dim=-1), torch.ones(64, device=device), atol=1e-4)
 
     def test_log_softmax(self, device):
-        assert (torch.log_softmax(torch.randn(64, 64, device=device), dim=-1) <= 0).all()
+        assert (
+            torch.log_softmax(torch.randn(64, 64, device=device), dim=-1) <= 0
+        ).all()
 
     def test_silu(self, device):
         x = torch.randn(64, 64, device=device)
@@ -165,6 +187,7 @@ class TestActivations:
 # ---------------------------------------------------------------------------
 # 6. Shape operations
 # ---------------------------------------------------------------------------
+
 
 class TestShapeOps:
     def test_reshape(self, device):
@@ -204,6 +227,7 @@ class TestShapeOps:
 # 7. Indexing and slicing
 # ---------------------------------------------------------------------------
 
+
 class TestIndexing:
     def test_slice_rows(self, device):
         t = torch.arange(24, device=device).reshape(4, 6).float()
@@ -228,6 +252,7 @@ class TestIndexing:
 # 8. Type casting
 # ---------------------------------------------------------------------------
 
+
 class TestTypeCasting:
     def test_to_float16(self, device):
         assert torch.randn(16, device=device).half().dtype == torch.float16
@@ -246,6 +271,7 @@ class TestTypeCasting:
 # 9. Device transfer
 # ---------------------------------------------------------------------------
 
+
 class TestDeviceTransfer:
     def test_roundtrip(self, device):
         cpu_t = torch.randn(32, 32)
@@ -258,6 +284,7 @@ class TestDeviceTransfer:
 # ---------------------------------------------------------------------------
 # 10. Autograd
 # ---------------------------------------------------------------------------
+
 
 class TestAutograd:
     def test_grad_computed(self, device):
@@ -280,11 +307,13 @@ class TestAutograd:
 # 11. Synchronization
 # ---------------------------------------------------------------------------
 
+
 class TestSync:
     def test_synchronize(self, device):
         dev_type = device.split(":")[0]
         if dev_type == "flagos":
             import torch_flagos
+
             torch_flagos.flagos.synchronize()
         else:
             torch.cuda.synchronize()

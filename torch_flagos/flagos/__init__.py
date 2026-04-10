@@ -83,8 +83,10 @@ from .random import *  # noqa: F403
 # Since flagos shares the same GPU as CUDA, we proxy to torch.cuda streams.
 # ---------------------------------------------------------------------------
 
+
 class Stream(torch.cuda.Stream):
     """Flagos stream that wraps a CUDA stream (same GPU memory)."""
+
     def __new__(cls, device=None, priority=0, **kwargs):
         if device is None:
             device = current_device()
@@ -93,6 +95,7 @@ class Stream(torch.cuda.Stream):
 
 class Event(torch.cuda.Event):
     """Flagos event that wraps a CUDA event."""
+
     pass
 
 

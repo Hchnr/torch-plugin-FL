@@ -3,6 +3,7 @@ from torch.utils.data import Dataset
 
 class DummyTextDataset(Dataset):
     """Simple dummy text dataset for testing training workflow"""
+
     def __init__(self, tokenizer, num_samples=100, max_length=256):
         self.tokenizer = tokenizer
         self.num_samples = num_samples
