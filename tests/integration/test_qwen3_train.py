@@ -162,7 +162,7 @@ class TestQwen3Training:
             f"avg_step={avg_time:.2f}s, "
             f"throughput={total_tokens / sum(step_times):.1f} tok/s"
         )
-        assert all(torch.isfinite(torch.tensor(l)) for l in losses), (
+        assert all(torch.isfinite(torch.tensor(loss)) for loss in losses), (
             "Some losses are not finite"
         )
 

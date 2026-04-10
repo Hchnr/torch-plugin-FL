@@ -23,7 +23,7 @@ def get_registered_ops() -> List[str]:
 def is_flaggems_available() -> bool:
     """Check if FlagGems is installed and available."""
     try:
-        import flag_gems
+        import flag_gems  # noqa: F401
 
         return True
     except ImportError:
@@ -66,7 +66,7 @@ def enable_flaggems_for_flagos(
         Number of operators successfully registered
     """
     try:
-        import flag_gems
+        import flag_gems  # noqa: F401
     except ImportError:
         raise ImportError(
             "flag_gems is required for this function. "
@@ -135,7 +135,7 @@ class use_flaggems:
         self._lib = torch.library.Library("aten", "IMPL")
 
         try:
-            import flag_gems
+            import flag_gems  # noqa: F401
             from flag_gems import _FULL_CONFIG
         except ImportError:
             raise ImportError("flag_gems is required")

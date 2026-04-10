@@ -75,7 +75,7 @@ def _lazy_init():
     _initialized = True
 
 
-from .random import *  # noqa: F403
+from .random import *  # noqa: F403, E402
 
 
 # ---------------------------------------------------------------------------
@@ -125,15 +125,15 @@ __all__ = [
     "current_device",
     "set_device",
     "synchronize",
-    "initial_seed",
+    "initial_seed",  # noqa: F405
     "is_available",
     "init",
     "is_initialized",
-    "random",
-    "manual_seed",
-    "manual_seed_all",
-    "get_rng_state",
-    "set_rng_state",
+    "random",  # noqa: F405
+    "manual_seed",  # noqa: F405
+    "manual_seed_all",  # noqa: F405
+    "get_rng_state",  # noqa: F405
+    "set_rng_state",  # noqa: F405
     "get_amp_supported_dtype",
     "Stream",
     "Event",

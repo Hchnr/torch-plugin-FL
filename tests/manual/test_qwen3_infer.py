@@ -19,7 +19,7 @@ print(f"Device count: {torch_flagos.flagos.device_count()}")
 print(f"FlagGems registered: {torch_flagos.is_flaggems_enabled()}")
 print(f"Registered ops count: {len(torch_flagos.get_registered_ops())}")
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 
 model_name = "/nfs/hcr/models/Qwen/Qwen3-0.6B"
 MAX_NEW_TOKENS = 128

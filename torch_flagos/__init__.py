@@ -4,7 +4,7 @@ from torch_flagos._maca_cudart_shim import ensure_cudart_shim
 
 ensure_cudart_shim()
 
-import torch
+import torch  # noqa: E402
 
 
 if sys.platform == "win32":
@@ -19,14 +19,14 @@ if sys.platform == "win32":
 # ABI-incompatible with MACA's cu-bridge (CUDA 11.6). This patches
 # torch.cuda.get_device_properties/get_device_name to use MACA's
 # native mcruntime API, allowing FlagGems initialization to succeed.
-from torch_flagos._maca_compat import is_maca_available, patch_torch_cuda_for_maca
+from torch_flagos._maca_compat import is_maca_available, patch_torch_cuda_for_maca  # noqa: E402
 
 if is_maca_available():
     patch_torch_cuda_for_maca()
 
 
-import torch_flagos._C  # type: ignore[misc]
-import torch_flagos.flagos
+import torch_flagos._C  # type: ignore[misc]  # noqa: E402
+import torch_flagos.flagos  # noqa: E402
 
 
 torch.utils.rename_privateuse1_backend("flagos")
@@ -266,7 +266,7 @@ _composite_ops_lib = _register_composite_ops()
 
 
 # Re-export integration utilities
-from torch_flagos.integration import (
+from torch_flagos.integration import (  # noqa: E402
     is_flaggems_available,
     enable_flaggems_for_flagos,
     use_flaggems,
