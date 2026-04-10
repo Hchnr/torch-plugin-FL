@@ -1,6 +1,10 @@
 import sys
 
-import torch
+from torch_flagos._maca_cudart_shim import ensure_cudart_shim
+
+ensure_cudart_shim()
+
+import torch  # noqa: E402
 
 
 if sys.platform == "win32":
@@ -10,8 +14,19 @@ if sys.platform == "win32":
     del _load_dll_libraries
 
 
-import torch_flagos._C  # type: ignore[misc]
-import torch_flagos.flagos
+# Apply MACA compatibility patches before importing FlagGems.
+# On MetaX (Muxi) hardware, PyTorch's bundled CUDA 12.x runtime is
+# ABI-incompatible with MACA's cu-bridge (CUDA 11.6). This patches
+# torch.cuda.get_device_properties/get_device_name to use MACA's
+# native mcruntime API, allowing FlagGems initialization to succeed.
+from torch_flagos._maca_compat import is_maca_available, patch_torch_cuda_for_maca  # noqa: E402
+
+if is_maca_available():
+    patch_torch_cuda_for_maca()
+
+
+import torch_flagos._C  # type: ignore[misc]  # noqa: E402
+import torch_flagos.flagos  # noqa: E402
 
 
 torch.utils.rename_privateuse1_backend("flagos")
@@ -21,6 +36,7 @@ torch.utils.generate_methods_for_privateuse1_backend(for_storage=True)
 
 # Global library instance to keep registrations alive
 _flaggems_lib = None
+_autograd_lib = None
 _registered_ops = []
 
 
@@ -37,8 +53,8 @@ def _patch_cuda_device_context():
 
     def _patched_cuda_device_init(self, device):
         # Handle flagos/privateuseone devices by extracting just the index
-        if hasattr(device, 'type') and hasattr(device, 'index'):
-            if device.type in ('privateuseone', 'flagos'):
+        if hasattr(device, "type") and hasattr(device, "index"):
+            if device.type in ("privateuseone", "flagos"):
                 device = device.index if device.index is not None else 0
         return _original_cuda_device_init(self, device)
 
@@ -53,61 +69,86 @@ _patch_cuda_device_context()
 # These don't work with flagos device and should use cpu_fallback instead
 _EXCLUDED_OPS = {
     # Factory functions that take device parameter
-    "randn", "randn_like",
-    "rand", "rand_like",
-    "zeros", "zeros_like",
-    "ones", "ones_like",
-    "full", "full_like",
-    "arange", "arange.start", "arange.start_step",
-    "linspace", "logspace",
-    "eye", "eye.m",
+    "randn",
+    "randn_like",
+    "rand",
+    "rand_like",
+    "zeros",
+    "zeros_like",
+    "ones",
+    "ones_like",
+    "full",
+    "full_like",
+    "arange",
+    "arange.start",
+    "arange.start_step",
+    "linspace",
+    "logspace",
+    "eye",
+    "eye.m",
     "randperm",
     "empty.memory_format",  # Already registered in C++
     "empty_strided",  # Already registered in C++
     # Random ops that use device context
-    "uniform_", "normal.float_Tensor", "normal.Tensor_float", "normal.Tensor_tensor",
-    "exponential_", "multinomial",
+    "uniform_",
+    "normal.float_Tensor",
+    "normal.Tensor_float",
+    "normal.Tensor_tensor",
+    "exponential_",
+    "multinomial",
+    # Copy ops - already registered in C++, skip to avoid duplicate registration
+    "copy_",
+    "_to_copy",
+    "contiguous",
+    "clone",
+    # log_softmax - FlagGems Triton kernel exceeds MACA's 4KB/thread private memory
+    # limit on large vocab (e.g. Qwen3 151k). Use Python decomposition instead.
+    "_log_softmax",
+    "_log_softmax_backward_data",
 }
 
 
-def _make_flagos_wrapper(impl_func):
-    """
-    Create a wrapper that sets up CUDA device context using device index
-    before calling the FlagGems implementation.
+# Cache for CUDA runtime library
+_cudart_lib = None
+_cudaMemcpy = None
 
-    FlagGems ops use torch.cuda.device(tensor.device) internally, but flagos
-    tensors have device type "privateuseone" which isn't recognized by CUDA.
-    This wrapper extracts the device index and sets CUDA context properly.
-    """
-    import functools
 
-    @functools.wraps(impl_func)
-    def wrapper(*args, **kwargs):
-        # Find the first tensor argument to get device index
-        device_index = None
-        for arg in args:
-            if isinstance(arg, torch.Tensor) and arg.device.type == "privateuseone":
-                device_index = arg.device.index
-                break
-        if device_index is None:
-            for v in kwargs.values():
-                if isinstance(v, torch.Tensor) and v.device.type == "privateuseone":
-                    device_index = v.device.index
-                    break
+def _get_cudaMemcpy():
+    """Get cudaMemcpy function from CUDA runtime library (cached)."""
+    global _cudart_lib, _cudaMemcpy
+    if _cudaMemcpy is not None:
+        return _cudaMemcpy
 
-        # Set CUDA device context using index (flagos uses same device indices as CUDA)
-        if device_index is not None:
-            with torch.cuda.device(device_index):
-                return impl_func(*args, **kwargs)
-        else:
-            return impl_func(*args, **kwargs)
+    import ctypes
+    import os
 
-    return wrapper
+    # Try to load CUDA runtime library
+    try:
+        _cudart_lib = ctypes.CDLL("libcudart.so")
+    except OSError:
+        cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
+        _cudart_lib = ctypes.CDLL(f"{cuda_home}/lib64/libcudart.so")
+
+    _cudaMemcpy = _cudart_lib.cudaMemcpy
+    _cudaMemcpy.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+    ]
+    _cudaMemcpy.restype = ctypes.c_int
+
+    return _cudaMemcpy
 
 
 def _register_flaggems_operators():
-    """Register FlagGems operators with the PrivateUse1 (flagos) dispatch key."""
-    global _flaggems_lib, _registered_ops
+    """
+    Register FlagGems operators with the PrivateUse1 (flagos) dispatch key.
+
+    Flagos and CUDA share the same GPU memory, so FlagGems Triton kernels
+    can operate directly on flagos tensor pointers without conversion.
+    """
+    global _flaggems_lib, _autograd_lib, _registered_ops
 
     try:
         from flag_gems import _FULL_CONFIG
@@ -117,6 +158,14 @@ def _register_flaggems_operators():
 
     _flaggems_lib = torch.library.Library("aten", "IMPL")
     _registered_ops = []
+
+    # Build mapping of backward ops
+    backward_ops = {}
+    for item in _FULL_CONFIG:
+        if len(item) >= 2:
+            op_name = item[0]
+            if "backward" in op_name.lower():
+                backward_ops[op_name] = item[1]
 
     for item in _FULL_CONFIG:
         if len(item) < 2:
@@ -136,15 +185,69 @@ def _register_flaggems_operators():
                 continue
 
         try:
-            # Wrap the implementation to handle flagos device context
-            wrapped_func = _make_flagos_wrapper(impl_func)
-            _flaggems_lib.impl(op_name, wrapped_func, "PrivateUse1")
+            _flaggems_lib.impl(op_name, impl_func, "PrivateUse1")
             _registered_ops.append(op_name)
         except Exception:
             # Some operators may already be registered or have incompatible signatures
             pass
 
     return len(_registered_ops)
+
+
+def _register_composite_ops():
+    """
+    Register CompositeExplicitAutograd ops that cause cpu_fallback segfault.
+
+    Some PyTorch ops are CompositeExplicitAutograd (not CompositeImplicitAutograd),
+    meaning they don't auto-decompose for PrivateUse1. They fall through to
+    cpu_fallback which segfaults when handling privateuseone tensors.
+
+    We register these manually by implementing them in terms of ops that are
+    already registered (like slice_scatter).
+    """
+    lib = torch.library.Library("aten", "IMPL")
+
+    # slice_backward: used by autograd for tensor slicing (x[..., :n])
+    # Implementation mirrors PyTorch's native slice_backward which calls slice_scatter
+    def slice_backward_impl(grad_output, input_sizes, dim, start, end, step):
+        # Convert SymInt to int for compatibility
+        input_sizes = [int(s) for s in input_sizes]
+        dim = int(dim)
+        start = int(start)
+        end = int(end)
+        step = int(step)
+        # Clamp end to input_sizes[dim] (PyTorch passes large values like sys.maxsize)
+        if end > input_sizes[dim]:
+            end = input_sizes[dim]
+        grad_input = torch.zeros(
+            input_sizes, dtype=grad_output.dtype, device=grad_output.device
+        )
+        return torch.slice_scatter(grad_input, grad_output, dim, start, end, step)
+
+    lib.impl("slice_backward", slice_backward_impl, "PrivateUse1")
+
+    # log_softmax: decompose into softmax + log to avoid FlagGems Triton kernel
+    # that exceeds MACA's 4KB/thread private memory on large vocab dimensions.
+    # The softmax kernel already has proper tiling for large N.
+    def log_softmax_impl(self, dim, half_to_float=False):
+        dtype = torch.float32 if half_to_float else self.dtype
+        out = torch.softmax(self.to(torch.float32), dim=dim)
+        out = torch.log(out)
+        return out.to(dtype)
+
+    def log_softmax_backward_impl(grad_output, output, dim, input_dtype):
+        exp_output = torch.exp(output)
+        grad_input = grad_output - exp_output * grad_output.sum(dim=dim, keepdim=True)
+        return grad_input.to(input_dtype)
+
+    lib.impl("_log_softmax", log_softmax_impl, "PrivateUse1")
+    lib.impl("_log_softmax_backward_data", log_softmax_backward_impl, "PrivateUse1")
+
+    return lib  # prevent GC
+
+
+# Hold reference to prevent garbage collection of the library
+_composite_ops_lib = None
 
 
 def get_registered_ops():
@@ -159,10 +262,11 @@ def is_flaggems_enabled():
 
 # Auto-register FlagGems operators on import
 _register_flaggems_operators()
+_composite_ops_lib = _register_composite_ops()
 
 
 # Re-export integration utilities
-from torch_flagos.integration import (
+from torch_flagos.integration import (  # noqa: E402
     is_flaggems_available,
     enable_flaggems_for_flagos,
     use_flaggems,
@@ -170,6 +274,7 @@ from torch_flagos.integration import (
 
 __all__ = [
     "flagos",
+    "distributed",
     "get_registered_ops",
     "is_flaggems_enabled",
     "is_flaggems_available",

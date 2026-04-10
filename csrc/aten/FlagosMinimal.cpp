@@ -99,10 +99,39 @@ at::Tensor wrapper_view(const at::Tensor& self, c10::SymIntArrayRef size) {
   return at::native::flagos::view(self, size);
 }
 
+at::Tensor wrapper_contiguous(
+    const at::Tensor& self,
+    c10::MemoryFormat memory_format) {
+  return at::native::flagos::contiguous(self, memory_format);
+}
+
+at::Tensor wrapper_clone(
+    const at::Tensor& self,
+    std::optional<c10::MemoryFormat> memory_format) {
+  return at::native::flagos::clone(self, memory_format);
+}
+
+at::Tensor wrapper__to_copy(
+    const at::Tensor& self,
+    std::optional<c10::ScalarType> dtype,
+    std::optional<c10::Layout> layout,
+    std::optional<c10::Device> device,
+    std::optional<bool> pin_memory,
+    bool non_blocking,
+    std::optional<c10::MemoryFormat> memory_format) {
+  return at::native::flagos::_to_copy(self, dtype, layout, device, pin_memory, non_blocking, memory_format);
+}
+
 void wrapper_cpu_fallback(
     const c10::OperatorHandle& op,
     torch::jit::Stack* stack) {
   at::native::flagos::cpu_fallback(op, stack);
+}
+
+void wrapper_record_stream(at::Tensor& self, at::Stream s) {
+  // No-op for flagos tensors.
+  // flagos uses cudaMalloc directly (not a caching allocator),
+  // so there is no need to track stream usage for memory management.
 }
 
 } // namespace
@@ -123,6 +152,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
       "set_.source_Storage_storage_offset",
       wrapper_set_source_Storage_storage_offsetset_);
   m.impl("view", wrapper_view);
+  m.impl("contiguous", wrapper_contiguous);
+  m.impl("clone", wrapper_clone);
+  m.impl("_to_copy", wrapper__to_copy);
+  m.impl("record_stream", wrapper_record_stream);
 }
 
 // Register fallback for all unimplemented operators
@@ -130,5 +163,37 @@ TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
   m.fallback(
       torch::CppFunction::makeFromBoxedFunction<&wrapper_cpu_fallback>());
 }
+
+// Register AutogradPrivateUse1 fallback to dispatch to PrivateUse1
+// This ensures operators like where.ScalarSelf work correctly through autograd dispatch
+TORCH_LIBRARY_IMPL(_, AutogradPrivateUse1, m) {
+  m.fallback(torch::CppFunction::makeFallthrough());
+}
+
+// Register autograd-aware contiguous for PrivateUse1 tensors.
+//
+// Problem: contiguous registered on PrivateUse1 bypasses autograd recording
+// (AutogradPrivateUse1 is fallthrough), causing grad_fn=None on the output
+// and breaking gradient propagation (e.g., in attention layers that use
+// transpose().contiguous()). On CUDA, contiguous() returns a tensor with
+// CloneBackward0 grad_fn; on flagos it returned grad_fn=None.
+//
+// Solution: Register contiguous on AutogradPrivateUse1 so it intercepts
+// the call before fallthrough. When the tensor actually needs copying
+// (is non-contiguous), we use clone(memory_format) which properly records
+// autograd operations. clone dispatches to PrivateUse1::clone which
+// handles the actual data copy.
+TORCH_LIBRARY_IMPL(aten, AutogradPrivateUse1, m) {
+  m.impl("contiguous", [](const at::Tensor& self, c10::MemoryFormat memory_format) -> at::Tensor {
+    if (self.is_contiguous(memory_format)) {
+      return self;
+    }
+    // clone(memory_format) creates a contiguous copy with autograd tracking.
+    // This dispatches to PrivateUse1::clone (which uses empty + copy_),
+    // and autograd records CloneBackward0 for gradient propagation.
+    return self.clone(memory_format);
+  });
+}
+
 
 } // namespace at::flagos

@@ -75,7 +75,48 @@ def _lazy_init():
     _initialized = True
 
 
-from .random import *  # noqa: F403
+from .random import *  # noqa: F403, E402
+
+
+# ---------------------------------------------------------------------------
+# Stream API required by FSDP
+# Since flagos shares the same GPU as CUDA, we proxy to torch.cuda streams.
+# ---------------------------------------------------------------------------
+
+
+class Stream(torch.cuda.Stream):
+    """Flagos stream that wraps a CUDA stream (same GPU memory)."""
+
+    def __new__(cls, device=None, priority=0, **kwargs):
+        if device is None:
+            device = current_device()
+        return super().__new__(cls, device=device, priority=priority, **kwargs)
+
+
+class Event(torch.cuda.Event):
+    """Flagos event that wraps a CUDA event."""
+
+    pass
+
+
+def current_stream(device=None):
+    """Return the currently selected stream for the given device."""
+    if device is None:
+        device = current_device()
+    return torch.cuda.current_stream(device)
+
+
+def stream(s):
+    """Context-manager that selects a given stream."""
+    return torch.cuda.stream(s)
+
+
+def get_amp_supported_dtype():
+    """Return list of supported dtypes for AMP (Automatic Mixed Precision).
+
+    Required by torch.autocast for custom device backends.
+    """
+    return [torch.float16, torch.bfloat16]
 
 
 __all__ = [
@@ -84,13 +125,18 @@ __all__ = [
     "current_device",
     "set_device",
     "synchronize",
-    "initial_seed",
+    "initial_seed",  # noqa: F405
     "is_available",
     "init",
     "is_initialized",
-    "random",
-    "manual_seed",
-    "manual_seed_all",
-    "get_rng_state",
-    "set_rng_state",
+    "random",  # noqa: F405
+    "manual_seed",  # noqa: F405
+    "manual_seed_all",  # noqa: F405
+    "get_rng_state",  # noqa: F405
+    "set_rng_state",  # noqa: F405
+    "get_amp_supported_dtype",
+    "Stream",
+    "Event",
+    "current_stream",
+    "stream",
 ]

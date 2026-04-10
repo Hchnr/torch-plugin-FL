@@ -14,11 +14,68 @@ from setuptools import Extension, find_packages, setup
 IS_DARWIN = platform.system() == "Darwin"
 IS_WINDOWS = platform.system() == "Windows"
 
+# GPU platform: "nvidia" (default) or "muxi"
+GPU_PLATFORM = os.environ.get("GPU_PLATFORM", "nvidia").lower()
+
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 
 # Only run cmake build for actual build commands, not metadata collection
-BUILD_COMMANDS = {"build", "build_ext", "install", "develop", "bdist_wheel", "bdist_egg", "editable_wheel"}
+BUILD_COMMANDS = {
+    "build",
+    "build_ext",
+    "install",
+    "develop",
+    "bdist_wheel",
+    "bdist_egg",
+    "editable_wheel",
+}
 RUN_BUILD_DEPS = any(arg in BUILD_COMMANDS for arg in sys.argv)
+
+
+def _ensure_maca_cudart_shim():
+    """On MACA, compile and load a complete cudart shim before importing torch.
+
+    MACA's libsymbol_cu.so provides CUDA runtime symbols but without the
+    @@libcudart.so.12 version tags that PyTorch's .so files require.
+    We build a single shared library (csrc/cudart_shim.c) that:
+      1. Forwards ~79 symbols to libsymbol_cu.so via dlsym
+      2. Stubs ~11 symbols for APIs missing from MACA entirely
+      3. Tags ALL exported symbols with @@libcudart.so.12 via a version script
+    """
+    import ctypes
+
+    csrc = os.path.join(BASE_DIR, "csrc")
+    build_dir = os.path.join(BASE_DIR, "build")
+    os.makedirs(build_dir, exist_ok=True)
+
+    shim_so = os.path.join(build_dir, "libcudart_shim.so")
+    shim_src = os.path.join(csrc, "cudart_shim.c")
+    version_script = os.path.join(csrc, "libcudart.version")
+
+    inputs = [shim_src, version_script]
+    if not os.path.exists(shim_so) or any(
+        os.path.exists(s) and os.path.getmtime(s) > os.path.getmtime(shim_so)
+        for s in inputs
+    ):
+        subprocess.check_call(
+            [
+                "gcc",
+                "-shared",
+                "-fPIC",
+                "-o",
+                shim_so,
+                shim_src,
+                f"-Wl,--version-script={version_script}",
+                "-Wl,-soname,libcudart.so.12",
+                "-ldl",
+            ]
+        )
+
+    ctypes.CDLL(shim_so, mode=ctypes.RTLD_GLOBAL)
+
+
+if GPU_PLATFORM == "muxi":
+    _ensure_maca_cudart_shim()
 
 
 def make_relative_rpath_args(path):
@@ -47,10 +104,20 @@ def build_deps():
         "-DPYTORCH_INSTALL_DIR=" + get_pytorch_dir(),
     ]
 
-    # Add CUDA toolkit path if available
-    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
-    if cuda_home:
-        cmake_args.append(f"-DCMAKE_CUDA_COMPILER={cuda_home}/bin/nvcc")
+    cmake_args.append(f"-DGPU_PLATFORM={GPU_PLATFORM}")
+
+    if GPU_PLATFORM == "muxi":
+        # Muxi MACA SDK: no nvcc needed. CMakeLists.txt pre-creates
+        # torch::cudart to skip PyTorch's cuda.cmake entirely.
+        maca_path = (
+            os.environ.get("MACA_PATH") or os.environ.get("MACA_HOME") or "/opt/maca"
+        )
+        cmake_args.append(f"-DMACA_PATH={maca_path}")
+    else:
+        # Add CUDA toolkit path if available
+        cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+        if cuda_home:
+            cmake_args.append(f"-DCMAKE_CUDA_COMPILER={cuda_home}/bin/nvcc")
 
     subprocess.check_call(
         ["cmake", BASE_DIR] + cmake_args, cwd=build_dir, env=os.environ

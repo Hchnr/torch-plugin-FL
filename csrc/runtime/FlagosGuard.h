@@ -50,20 +50,58 @@ struct FlagosGuardImpl final : public c10::impl::DeviceGuardImplInterface {
   }
 
   c10::Stream getStream(c10::Device d) const noexcept override {
-    // Return default stream for now
-    return c10::Stream(c10::Stream::DEFAULT, d);
+    // Return stream with ID 0 (not DEFAULT which is -1)
+    // The autograd engine expects valid stream IDs
+    return c10::Stream(c10::Stream::UNSAFE, d, 0);
   }
 
   c10::Stream getDefaultStream(c10::Device d) const override {
-    return c10::Stream(c10::Stream::DEFAULT, d);
+    return c10::Stream(c10::Stream::UNSAFE, d, 0);
   }
 
   c10::Stream getStreamFromGlobalPool(c10::Device d, bool isHighPriority = false) const override {
-    return c10::Stream(c10::Stream::DEFAULT, d);
+    return c10::Stream(c10::Stream::UNSAFE, d, 0);
   }
 
   c10::Stream exchangeStream(c10::Stream s) const noexcept override {
-    return s;  // No-op for now
+    return c10::Stream(c10::Stream::UNSAFE, s.device(), 0);
+  }
+
+  c10::Stream getNewStream(c10::Device d, int priority = 0) const override {
+    return c10::Stream(c10::Stream::UNSAFE, d, 0);
+  }
+
+  bool queryStream(const c10::Stream& stream) const override {
+    // Synchronize CUDA to ensure all operations are complete
+    foDeviceSynchronize();
+    return true;
+  }
+
+  void synchronizeStream(const c10::Stream& stream) const override {
+    foDeviceSynchronize();
+  }
+
+  void synchronizeEvent(void* event) const override {
+    if (event) {
+      foEventSynchronize((foEvent_t)event);
+    }
+  }
+
+  void recordDataPtrOnStream(
+      const c10::DataPtr& data_ptr,
+      const c10::Stream& stream) const override {
+    // No-op: flagos uses CUDA memory which is already tracked
+  }
+
+  double elapsedTime(
+      void* event1,
+      void* event2,
+      const c10::DeviceIndex device_index) const override {
+    float ms = 0.0f;
+    if (event1 && event2) {
+      foEventElapsedTime(&ms, (foEvent_t)event1, (foEvent_t)event2);
+    }
+    return static_cast<double>(ms);
   }
 
   c10::DeviceIndex deviceCount() const noexcept override {
