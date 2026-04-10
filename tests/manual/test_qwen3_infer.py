@@ -1,5 +1,9 @@
 """
-Qwen3 Inference Test - Using torch_flagos
+Qwen3 Inference Test - Using torch_flagos (MACA manual test)
+
+Usage:
+    python tests/manual/test_qwen3_infer.py
+    LD_LIBRARY_PATH=/opt/maca-3.3.0/tools/cu-bridge/lib:$LD_LIBRARY_PATH python tests/manual/test_qwen3_infer.py
 """
 
 import torch_flagos  # Must be imported before torch on MACA (loads cudart shim)
@@ -10,7 +14,6 @@ print("=" * 60)
 print("torch_flagos Qwen3 Inference Test")
 print("=" * 60)
 
-# Check device status
 print(f"\nFlagos device available: {torch_flagos.flagos.is_available()}")
 print(f"Device count: {torch_flagos.flagos.device_count()}")
 print(f"FlagGems registered: {torch_flagos.is_flaggems_enabled()}")
@@ -19,99 +22,66 @@ print(f"Registered ops count: {len(torch_flagos.get_registered_ops())}")
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 model_name = "/nfs/hcr/models/Qwen/Qwen3-0.6B"
-MAX_NEW_TOKENS = 128  # Smaller token count for testing
+MAX_NEW_TOKENS = 128
 DEVICE = "flagos:0"
 
-# Load model
 print("\n[1] Loading model...")
 load_start = time.time()
 tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-# Load to CPU first, then move to flagos device
 model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype=torch.float16,
-    device_map="cpu"  # Load to CPU first
+    model_name, torch_dtype=torch.float16, device_map="cpu"
 )
-# Move model to flagos device
 model = model.to(DEVICE)
+model.eval()
 print(f"Model device: {next(model.parameters()).device}")
 print(f"Model load time: {time.time() - load_start:.2f}s")
 
-# Prepare input
 prompt = "Give me a short introduction to large language model."
 messages = [{"role": "user", "content": prompt}]
 text = tokenizer.apply_chat_template(
-    messages,
-    tokenize=False,
-    add_generation_prompt=True,
-    enable_thinking=False  # Disable thinking to speed up test
+    messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
 )
 model_inputs = tokenizer([text], return_tensors="pt").to(DEVICE)
 input_len = model_inputs.input_ids.shape[1]
 print(f"Input token count: {input_len}")
 
-# Sync function
+
 def sync():
     torch_flagos.flagos.synchronize()
 
-# First inference (includes Triton compilation)
-print(f"\n[2] First inference - includes Triton kernel compilation (max_new_tokens={MAX_NEW_TOKENS})...")
-print("    (First run will trigger Triton kernel compilation, may take longer)")
-sync()
-start1 = time.time()
-with torch.no_grad():
-    output1 = model.generate(**model_inputs, max_new_tokens=MAX_NEW_TOKENS)
-sync()
-time1 = time.time() - start1
-tokens1 = output1.shape[1] - input_len
-print(f"First inference time: {time1:.2f}s, generated {tokens1} tokens, speed: {tokens1/time1:.2f} tokens/s")
 
-# Second inference (using compilation cache)
-print(f"\n[3] Second inference - using Triton cache (max_new_tokens={MAX_NEW_TOKENS})...")
-sync()
-start2 = time.time()
-with torch.no_grad():
-    output2 = model.generate(**model_inputs, max_new_tokens=MAX_NEW_TOKENS)
-sync()
-time2 = time.time() - start2
-tokens2 = output2.shape[1] - input_len
-print(f"Second inference time: {time2:.2f}s, generated {tokens2} tokens, speed: {tokens2/time2:.2f} tokens/s")
+times = []
+token_counts = []
+run_labels = [
+    "First (includes Triton kernel compilation)",
+    "Second (using Triton cache)",
+    "Third",
+    "Fourth",
+]
+for i in range(4):
+    print(f"\n[{i+2}] {run_labels[i]} (max_new_tokens={MAX_NEW_TOKENS})...")
+    if i == 0:
+        print("    (First run will trigger Triton kernel compilation, may take longer)")
+    sync()
+    t0 = time.time()
+    with torch.no_grad():
+        output = model.generate(**model_inputs, max_new_tokens=MAX_NEW_TOKENS)
+    sync()
+    elapsed = time.time() - t0
+    new_tokens = output.shape[1] - input_len
+    times.append(elapsed)
+    token_counts.append(new_tokens)
+    print(f"{run_labels[i]}: {elapsed:.2f}s, {new_tokens} tokens, {new_tokens/elapsed:.2f} tokens/s")
 
-# Third inference
-print(f"\n[4] Third inference (max_new_tokens={MAX_NEW_TOKENS})...")
-sync()
-start3 = time.time()
-with torch.no_grad():
-    output3 = model.generate(**model_inputs, max_new_tokens=MAX_NEW_TOKENS)
-sync()
-time3 = time.time() - start3
-tokens3 = output3.shape[1] - input_len
-print(f"Third inference time: {time3:.2f}s, generated {tokens3} tokens, speed: {tokens3/time3:.2f} tokens/s")
-
-# Fourth inference
-print(f"\n[5] Fourth inference (max_new_tokens={MAX_NEW_TOKENS})...")
-sync()
-start4 = time.time()
-with torch.no_grad():
-    output4 = model.generate(**model_inputs, max_new_tokens=MAX_NEW_TOKENS)
-sync()
-time4 = time.time() - start4
-tokens4 = output4.shape[1] - input_len
-print(f"Fourth inference time: {time4:.2f}s, generated {tokens4} tokens, speed: {tokens4/time4:.2f} tokens/s")
-
-# Summary
 print("\n" + "=" * 60)
 print("Summary (torch_flagos + FlagGems):")
-print(f"  First (with compilation): {time1:.2f}s ({tokens1/time1:.2f} tokens/s)")
-print(f"  Second (using cache): {time2:.2f}s ({tokens2/time2:.2f} tokens/s)")
-print(f"  Third: {time3:.2f}s ({tokens3/time3:.2f} tokens/s)")
-print(f"  Fourth: {time4:.2f}s ({tokens4/time4:.2f} tokens/s)")
-print(f"  Average (runs 2-4): {(time2+time3+time4)/3:.2f}s ({(tokens2+tokens3+tokens4)/(time2+time3+time4):.2f} tokens/s)")
-print("-" * 60)
-print(f"  Estimated Triton compilation overhead: {time1 - (time2+time3+time4)/3:.2f}s")
+for label, t, tc in zip(run_labels, times, token_counts):
+    print(f"  {label}: {t:.2f}s ({tc/t:.2f} tokens/s)")
+avg_t = sum(times[1:]) / 3
+avg_tps = sum(token_counts[1:]) / sum(times[1:])
+print(f"  Average (runs 2-4): {avg_t:.2f}s ({avg_tps:.2f} tokens/s)")
+print(f"  Estimated Triton compilation overhead: {times[0] - avg_t:.2f}s")
 print("=" * 60)
 
-# Output generated content
 print("\nGenerated content:")
-print(tokenizer.decode(output4[0][input_len:], skip_special_tokens=True))
+print(tokenizer.decode(output[0][input_len:], skip_special_tokens=True))
