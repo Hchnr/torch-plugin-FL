@@ -12,7 +12,6 @@ Usage:
 import os
 import sys
 import time
-import functools
 
 import pytest
 import torch
@@ -22,11 +21,10 @@ from dummy_dataset import DummyTextDataset
 from torch.utils.data import DataLoader
 
 
-
-
 def sync(dev):
     if dev == "flagos":
         import torch_flagos
+
         torch_flagos.flagos.synchronize()
     else:
         torch.cuda.synchronize()
@@ -43,11 +41,13 @@ def ctx(request):
 
     if dev == "flagos":
         import torch_flagos
+
         torch_flagos.flagos.set_device(0)
 
     device = f"{dev}:0"
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
+
     print(f"\n[1] Loading model ({model_path})...")
     t0 = time.time()
     tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -55,7 +55,9 @@ def ctx(request):
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=torch.float32, device_map="cpu",
+        model_path,
+        torch_dtype=torch.float32,
+        device_map="cpu",
         attn_implementation="eager",
     )
     model = model.to(device)
@@ -79,18 +81,25 @@ def ctx(request):
     total = sum(p.numel() for p in model.parameters()) / 1e6
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
     print(f"    Parameters: {total:.2f}M total, {trainable:.2f}M trainable")
-    print(f"    Load time: {time.time()-t0:.2f}s")
+    print(f"    Load time: {time.time() - t0:.2f}s")
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=lr
     )
     dataset = DummyTextDataset(tokenizer, num_samples=100, max_length=seq_len)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    dataloader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=True, drop_last=True
+    )
 
     return {
-        "model": model, "tokenizer": tokenizer, "optimizer": optimizer,
-        "dataloader": dataloader, "device": device, "dev": dev,
-        "steps": steps, "batch_size": batch_size,
+        "model": model,
+        "tokenizer": tokenizer,
+        "optimizer": optimizer,
+        "dataloader": dataloader,
+        "device": device,
+        "dev": dev,
+        "steps": steps,
+        "batch_size": batch_size,
     }
 
 
@@ -115,8 +124,12 @@ def train_steps(ctx, n):
 
         sync(dev)
         t0 = time.time()
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask,
-                        labels=labels, use_cache=False)
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            use_cache=False,
+        )
         loss = outputs.loss
         loss.backward()
         optimizer.step()
@@ -144,11 +157,14 @@ class TestQwen3Training:
         avg_loss = sum(losses) / len(losses)
         avg_time = sum(step_times) / len(step_times)
         total_tokens = ctx["batch_size"] * 1024 * len(step_times)
-        print(f"\n  Steps 2-{ctx['steps']}: avg_loss={avg_loss:.4f}, "
-              f"avg_step={avg_time:.2f}s, "
-              f"throughput={total_tokens/sum(step_times):.1f} tok/s")
-        assert all(torch.isfinite(torch.tensor(l)) for l in losses), \
+        print(
+            f"\n  Steps 2-{ctx['steps']}: avg_loss={avg_loss:.4f}, "
+            f"avg_step={avg_time:.2f}s, "
+            f"throughput={total_tokens / sum(step_times):.1f} tok/s"
+        )
+        assert all(torch.isfinite(torch.tensor(loss)) for loss in losses), (
             "Some losses are not finite"
+        )
 
     def test_gradient_flows(self, ctx):
         """Verify gradients are non-zero after a training step."""
@@ -160,10 +176,15 @@ class TestQwen3Training:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask,
-                        labels=labels, use_cache=False)
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            use_cache=False,
+        )
         outputs.loss.backward()
-        grad_params = [p for p in model.parameters()
-                       if p.requires_grad and p.grad is not None]
+        grad_params = [
+            p for p in model.parameters() if p.requires_grad and p.grad is not None
+        ]
         ctx["model"].zero_grad(set_to_none=True)
         assert len(grad_params) > 0, "No parameters received gradients"

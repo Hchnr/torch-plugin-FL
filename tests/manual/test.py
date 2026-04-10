@@ -68,5 +68,3 @@ print(f"Flagos device count: {torch_flagos.flagos.device_count()}")
 print(f"Current device before set_device: {torch_flagos.flagos.current_device()}")
 torch_flagos.flagos.set_device(1)
 print(f"Current device after set_device: {torch_flagos.flagos.current_device()}")
-
-

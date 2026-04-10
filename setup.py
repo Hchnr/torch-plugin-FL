@@ -20,7 +20,15 @@ GPU_PLATFORM = os.environ.get("GPU_PLATFORM", "nvidia").lower()
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 
 # Only run cmake build for actual build commands, not metadata collection
-BUILD_COMMANDS = {"build", "build_ext", "install", "develop", "bdist_wheel", "bdist_egg", "editable_wheel"}
+BUILD_COMMANDS = {
+    "build",
+    "build_ext",
+    "install",
+    "develop",
+    "bdist_wheel",
+    "bdist_egg",
+    "editable_wheel",
+}
 RUN_BUILD_DEPS = any(arg in BUILD_COMMANDS for arg in sys.argv)
 
 
@@ -49,12 +57,19 @@ def _ensure_maca_cudart_shim():
         os.path.exists(s) and os.path.getmtime(s) > os.path.getmtime(shim_so)
         for s in inputs
     ):
-        subprocess.check_call([
-            "gcc", "-shared", "-fPIC", "-o", shim_so, shim_src,
-            f"-Wl,--version-script={version_script}",
-            "-Wl,-soname,libcudart.so.12",
-            "-ldl",
-        ])
+        subprocess.check_call(
+            [
+                "gcc",
+                "-shared",
+                "-fPIC",
+                "-o",
+                shim_so,
+                shim_src,
+                f"-Wl,--version-script={version_script}",
+                "-Wl,-soname,libcudart.so.12",
+                "-ldl",
+            ]
+        )
 
     ctypes.CDLL(shim_so, mode=ctypes.RTLD_GLOBAL)
 
@@ -95,9 +110,7 @@ def build_deps():
         # Muxi MACA SDK: no nvcc needed. CMakeLists.txt pre-creates
         # torch::cudart to skip PyTorch's cuda.cmake entirely.
         maca_path = (
-            os.environ.get("MACA_PATH")
-            or os.environ.get("MACA_HOME")
-            or "/opt/maca"
+            os.environ.get("MACA_PATH") or os.environ.get("MACA_HOME") or "/opt/maca"
         )
         cmake_args.append(f"-DMACA_PATH={maca_path}")
     else:

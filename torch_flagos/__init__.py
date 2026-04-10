@@ -1,9 +1,10 @@
 import sys
 
 from torch_flagos._maca_cudart_shim import ensure_cudart_shim
+
 ensure_cudart_shim()
 
-import torch
+import torch  # noqa: E402
 
 
 if sys.platform == "win32":
@@ -18,14 +19,14 @@ if sys.platform == "win32":
 # ABI-incompatible with MACA's cu-bridge (CUDA 11.6). This patches
 # torch.cuda.get_device_properties/get_device_name to use MACA's
 # native mcruntime API, allowing FlagGems initialization to succeed.
-from torch_flagos._maca_compat import is_maca_available, patch_torch_cuda_for_maca
+from torch_flagos._maca_compat import is_maca_available, patch_torch_cuda_for_maca  # noqa: E402
 
 if is_maca_available():
     patch_torch_cuda_for_maca()
 
 
-import torch_flagos._C  # type: ignore[misc]
-import torch_flagos.flagos
+import torch_flagos._C  # type: ignore[misc]  # noqa: E402
+import torch_flagos.flagos  # noqa: E402
 
 
 torch.utils.rename_privateuse1_backend("flagos")
@@ -52,8 +53,8 @@ def _patch_cuda_device_context():
 
     def _patched_cuda_device_init(self, device):
         # Handle flagos/privateuseone devices by extracting just the index
-        if hasattr(device, 'type') and hasattr(device, 'index'):
-            if device.type in ('privateuseone', 'flagos'):
+        if hasattr(device, "type") and hasattr(device, "index"):
+            if device.type in ("privateuseone", "flagos"):
                 device = device.index if device.index is not None else 0
         return _original_cuda_device_init(self, device)
 
@@ -68,25 +69,42 @@ _patch_cuda_device_context()
 # These don't work with flagos device and should use cpu_fallback instead
 _EXCLUDED_OPS = {
     # Factory functions that take device parameter
-    "randn", "randn_like",
-    "rand", "rand_like",
-    "zeros", "zeros_like",
-    "ones", "ones_like",
-    "full", "full_like",
-    "arange", "arange.start", "arange.start_step",
-    "linspace", "logspace",
-    "eye", "eye.m",
+    "randn",
+    "randn_like",
+    "rand",
+    "rand_like",
+    "zeros",
+    "zeros_like",
+    "ones",
+    "ones_like",
+    "full",
+    "full_like",
+    "arange",
+    "arange.start",
+    "arange.start_step",
+    "linspace",
+    "logspace",
+    "eye",
+    "eye.m",
     "randperm",
     "empty.memory_format",  # Already registered in C++
     "empty_strided",  # Already registered in C++
     # Random ops that use device context
-    "uniform_", "normal.float_Tensor", "normal.Tensor_float", "normal.Tensor_tensor",
-    "exponential_", "multinomial",
+    "uniform_",
+    "normal.float_Tensor",
+    "normal.Tensor_float",
+    "normal.Tensor_tensor",
+    "exponential_",
+    "multinomial",
     # Copy ops - already registered in C++, skip to avoid duplicate registration
-    "copy_", "_to_copy", "contiguous", "clone",
+    "copy_",
+    "_to_copy",
+    "contiguous",
+    "clone",
     # log_softmax - FlagGems Triton kernel exceeds MACA's 4KB/thread private memory
     # limit on large vocab (e.g. Qwen3 151k). Use Python decomposition instead.
-    "_log_softmax", "_log_softmax_backward_data",
+    "_log_softmax",
+    "_log_softmax_backward_data",
 }
 
 
@@ -112,7 +130,12 @@ def _get_cudaMemcpy():
         _cudart_lib = ctypes.CDLL(f"{cuda_home}/lib64/libcudart.so")
 
     _cudaMemcpy = _cudart_lib.cudaMemcpy
-    _cudaMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    _cudaMemcpy.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+    ]
     _cudaMemcpy.restype = ctypes.c_int
 
     return _cudaMemcpy
@@ -141,7 +164,7 @@ def _register_flaggems_operators():
     for item in _FULL_CONFIG:
         if len(item) >= 2:
             op_name = item[0]
-            if 'backward' in op_name.lower():
+            if "backward" in op_name.lower():
                 backward_ops[op_name] = item[1]
 
     for item in _FULL_CONFIG:
@@ -196,7 +219,9 @@ def _register_composite_ops():
         # Clamp end to input_sizes[dim] (PyTorch passes large values like sys.maxsize)
         if end > input_sizes[dim]:
             end = input_sizes[dim]
-        grad_input = torch.zeros(input_sizes, dtype=grad_output.dtype, device=grad_output.device)
+        grad_input = torch.zeros(
+            input_sizes, dtype=grad_output.dtype, device=grad_output.device
+        )
         return torch.slice_scatter(grad_input, grad_output, dim, start, end, step)
 
     lib.impl("slice_backward", slice_backward_impl, "PrivateUse1")
@@ -241,7 +266,7 @@ _composite_ops_lib = _register_composite_ops()
 
 
 # Re-export integration utilities
-from torch_flagos.integration import (
+from torch_flagos.integration import (  # noqa: E402
     is_flaggems_available,
     enable_flaggems_for_flagos,
     use_flaggems,

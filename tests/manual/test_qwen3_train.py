@@ -31,7 +31,6 @@ import functools
 import os
 import time
 
-import torch_flagos
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
@@ -42,19 +41,37 @@ from dummy_dataset import DummyTextDataset
 # Argument parsing
 # ---------------------------------------------------------------------------
 
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Qwen3 Training Test")
-    parser.add_argument("--device", choices=["cuda", "flagos"], default="flagos",
-                        help="Device type (default: flagos)")
-    parser.add_argument("--parallel", choices=["none", "ddp", "fsdp"], default="none",
-                        help="Parallel strategy (default: none)")
-    parser.add_argument("--comm", choices=["nccl", "flagcx"], default="nccl",
-                        help="Communication backend for distributed (default: nccl)")
-    parser.add_argument("--model", default="/nfs/hcr/models/Qwen/Qwen3-0.6B",
-                        help="Model path")
+    parser.add_argument(
+        "--device",
+        choices=["cuda", "flagos"],
+        default="flagos",
+        help="Device type (default: flagos)",
+    )
+    parser.add_argument(
+        "--parallel",
+        choices=["none", "ddp", "fsdp"],
+        default="none",
+        help="Parallel strategy (default: none)",
+    )
+    parser.add_argument(
+        "--comm",
+        choices=["nccl", "flagcx"],
+        default="nccl",
+        help="Communication backend for distributed (default: nccl)",
+    )
+    parser.add_argument(
+        "--model", default="/nfs/hcr/models/Qwen/Qwen3-0.6B", help="Model path"
+    )
     parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--seq-len", type=int, default=None,
-                        help="Sequence length (default: 1024 for single, 256 for distributed)")
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=None,
+        help="Sequence length (default: 1024 for single, 256 for distributed)",
+    )
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-5)
     args = parser.parse_args()
@@ -67,9 +84,11 @@ def parse_args():
 # Sync & printing utilities
 # ---------------------------------------------------------------------------
 
+
 def sync(args):
     if args.device == "flagos":
         import torch_flagos
+
         torch_flagos.flagos.synchronize()
     else:
         torch.cuda.synchronize()
@@ -84,6 +103,7 @@ def print_rank0(msg, rank):
 # Device & distributed setup
 # ---------------------------------------------------------------------------
 
+
 def setup(args):
     """Initialize device and (optionally) distributed environment.
 
@@ -94,6 +114,7 @@ def setup(args):
 
     if args.device == "flagos":
         import torch_flagos
+
         torch_flagos.flagos.set_device(local_rank)
     else:
         torch.cuda.set_device(local_rank)
@@ -104,10 +125,12 @@ def setup(args):
     # --- Distributed init ---
     if args.device == "flagos":
         import torch_flagos.distributed as flagos_dist
+
         flagos_dist.init_process_group(backend=args.comm)
     else:
         if args.comm == "flagcx":
             import flagcx  # noqa: F401
+
             dist.init_process_group(backend="cpu:gloo,cuda:flagcx")
         else:
             dist.init_process_group(backend="nccl")
@@ -132,6 +155,7 @@ def cleanup(args):
 # Model loading
 # ---------------------------------------------------------------------------
 
+
 def load_model(args, device, rank):
     """Load model and tokenizer, detect & freeze unused params."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -154,7 +178,9 @@ def load_model(args, device, rank):
     print_rank0("\n[1.5] Detecting and freezing unused parameters...", rank)
     dummy_input = torch.randint(0, 1000, (1, 32), device=device)
     with torch.enable_grad():
-        out = model(input_ids=dummy_input, attention_mask=None, labels=None, use_cache=False)
+        out = model(
+            input_ids=dummy_input, attention_mask=None, labels=None, use_cache=False
+        )
         out.logits.sum().backward()
 
     unused_params = []
@@ -174,8 +200,14 @@ def load_model(args, device, rank):
 
     sync(args)
     print_rank0(f"Model device: {next(model.parameters()).device}", rank)
-    print_rank0(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M", rank)
-    print_rank0(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}M", rank)
+    print_rank0(
+        f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M",
+        rank,
+    )
+    print_rank0(
+        f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}M",
+        rank,
+    )
     print_rank0(f"Model load time: {time.time() - load_start:.2f}s", rank)
 
     return model, tokenizer
@@ -185,14 +217,17 @@ def load_model(args, device, rank):
 # DDP wrapping
 # ---------------------------------------------------------------------------
 
+
 def wrap_ddp(model, args, local_rank, rank):
     """Wrap model with DDP."""
     if args.device == "flagos":
         import torch_flagos.distributed as flagos_dist
+
         model = flagos_dist.DistributedDataParallel(model)
         print_rank0("    DDP: flagos mode (python_reducer + custom grad hooks)", rank)
     else:
         from torch.nn.parallel import DistributedDataParallel as DDP
+
         model = DDP(model, device_ids=[local_rank])
         print_rank0("    DDP: standard mode (CUDA)", rank)
     return model
@@ -201,6 +236,7 @@ def wrap_ddp(model, args, local_rank, rank):
 # ---------------------------------------------------------------------------
 # FSDP wrapping
 # ---------------------------------------------------------------------------
+
 
 def wrap_fsdp(model, args, device, rank):
     """Wrap model with FSDP."""
@@ -231,7 +267,9 @@ def wrap_fsdp(model, args, device, rank):
         out = model(input_ids=dummy_input, use_cache=False)
         out.logits.sum().backward()
 
-    unused = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
+    unused = [
+        n for n, p in model.named_parameters() if p.requires_grad and p.grad is None
+    ]
     print_rank0(f"    Parameters without gradient: {len(unused)}", rank)
     model.zero_grad(set_to_none=True)
 
@@ -243,12 +281,15 @@ def wrap_fsdp(model, args, device, rank):
 # DataLoader
 # ---------------------------------------------------------------------------
 
+
 def create_dataloader(args, tokenizer, world_size, rank):
     """Create dataloader (with DistributedSampler if distributed)."""
     dataset = DummyTextDataset(tokenizer, num_samples=100, max_length=args.seq_len)
     sampler = None
     if args.parallel != "none":
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        sampler = DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank, shuffle=True
+        )
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -262,6 +303,7 @@ def create_dataloader(args, tokenizer, world_size, rank):
 # ---------------------------------------------------------------------------
 # Training step
 # ---------------------------------------------------------------------------
+
 
 def train_step(model, batch, device, args):
     """Forward + loss computation.
@@ -286,6 +328,7 @@ def train_step(model, batch, device, args):
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
+
 
 def print_summary(args, step_times, total_loss, total_tokens, world_size, rank):
     label_parts = []
@@ -319,24 +362,39 @@ def print_summary(args, step_times, total_loss, total_tokens, world_size, rank):
         first = step_times[0]
         rest = step_times[1:]
         avg = sum(rest) / len(rest)
-        print_rank0(f"  First step: {first:.2f}s ({tokens_per_step/first:.1f} tokens/s{suffix})", rank)
-        print_rank0(f"  Average subsequent steps: {avg:.2f}s ({tokens_per_step/avg:.1f} tokens/s{suffix})", rank)
+        print_rank0(
+            f"  First step: {first:.2f}s ({tokens_per_step / first:.1f} tokens/s{suffix})",
+            rank,
+        )
+        print_rank0(
+            f"  Average subsequent steps: {avg:.2f}s ({tokens_per_step / avg:.1f} tokens/s{suffix})",
+            rank,
+        )
     else:
         avg = step_times[0]
-        print_rank0(f"  Average per step: {avg:.2f}s ({tokens_per_step/avg:.1f} tokens/s{suffix})", rank)
+        print_rank0(
+            f"  Average per step: {avg:.2f}s ({tokens_per_step / avg:.1f} tokens/s{suffix})",
+            rank,
+        )
 
     print_rank0("-" * 60, rank)
     total_time = sum(step_times)
     print_rank0(f"  Total training time: {total_time:.2f}s", rank)
-    print_rank0(f"  Overall throughput{suffix}: {total_tokens / total_time:.1f} tokens/s", rank)
+    print_rank0(
+        f"  Overall throughput{suffix}: {total_tokens / total_time:.1f} tokens/s", rank
+    )
     if args.parallel != "none":
-        print_rank0(f"  Overall throughput (all GPUs): {total_tokens * world_size / total_time:.1f} tokens/s", rank)
+        print_rank0(
+            f"  Overall throughput (all GPUs): {total_tokens * world_size / total_time:.1f} tokens/s",
+            rank,
+        )
     print_rank0("=" * 60, rank)
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main():
     args = parse_args()
@@ -355,16 +413,23 @@ def main():
 
     if args.device == "flagos":
         import torch_flagos
-        print_rank0(f"Flagos device available: {torch_flagos.flagos.is_available()}", rank)
+
+        print_rank0(
+            f"Flagos device available: {torch_flagos.flagos.is_available()}", rank
+        )
         print_rank0(f"FlagGems registered: {torch_flagos.is_flaggems_enabled()}", rank)
-        print_rank0(f"Registered ops count: {len(torch_flagos.get_registered_ops())}", rank)
+        print_rank0(
+            f"Registered ops count: {len(torch_flagos.get_registered_ops())}", rank
+        )
     else:
         print_rank0(f"CUDA available: {torch.cuda.is_available()}", rank)
         if torch.cuda.is_available():
             print_rank0(f"CUDA device: {torch.cuda.get_device_name(local_rank)}", rank)
 
     if args.parallel != "none":
-        print_rank0(f"World size: {world_size}, rank: {rank}, local_rank: {local_rank}", rank)
+        print_rank0(
+            f"World size: {world_size}, rank: {rank}, local_rank: {local_rank}", rank
+        )
 
     # --- Load model ---
     model, tokenizer = load_model(args, device, rank)
@@ -386,7 +451,10 @@ def main():
     print_rank0("\n[2] Creating dataset...", rank)
     dataloader, sampler = create_dataloader(args, tokenizer, world_size, rank)
     print_rank0(f"Dataset size: {len(dataloader.dataset)}", rank)
-    print_rank0(f"Batch size{' per GPU' if args.parallel != 'none' else ''}: {args.batch_size}", rank)
+    print_rank0(
+        f"Batch size{' per GPU' if args.parallel != 'none' else ''}: {args.batch_size}",
+        rank,
+    )
     if args.parallel != "none":
         print_rank0(f"Global batch size: {args.batch_size * world_size}", rank)
     print_rank0(f"Sequence length: {args.seq_len}", rank)
@@ -398,7 +466,9 @@ def main():
 
     # --- Training loop ---
     parallel_label = f" {args.parallel.upper()}" if args.parallel != "none" else ""
-    print_rank0(f"\n[4] Starting{parallel_label} training ({args.steps} steps)...", rank)
+    print_rank0(
+        f"\n[4] Starting{parallel_label} training ({args.steps} steps)...", rank
+    )
 
     total_tokens = 0
     total_loss = 0.0

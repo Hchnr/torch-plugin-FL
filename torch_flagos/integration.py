@@ -23,16 +23,15 @@ def get_registered_ops() -> List[str]:
 def is_flaggems_available() -> bool:
     """Check if FlagGems is installed and available."""
     try:
-        import flag_gems
+        import flag_gems  # noqa: F401
+
         return True
     except ImportError:
         return False
 
 
 def register_flagos_operator(
-    op_name: str,
-    impl_func: Callable,
-    schema: Optional[str] = None
+    op_name: str, impl_func: Callable, schema: Optional[str] = None
 ) -> None:
     """
     Register a FlagGems operator implementation for the flagos device.
@@ -48,8 +47,7 @@ def register_flagos_operator(
 
 
 def enable_flaggems_for_flagos(
-    exclude: Optional[List[str]] = None,
-    include: Optional[List[str]] = None
+    exclude: Optional[List[str]] = None, include: Optional[List[str]] = None
 ) -> int:
     """
     Enable FlagGems operators for the flagos device.
@@ -68,7 +66,7 @@ def enable_flaggems_for_flagos(
         Number of operators successfully registered
     """
     try:
-        import flag_gems
+        import flag_gems  # noqa: F401
     except ImportError:
         raise ImportError(
             "flag_gems is required for this function. "
@@ -127,9 +125,7 @@ class use_flaggems:
     """
 
     def __init__(
-        self,
-        exclude: Optional[List[str]] = None,
-        include: Optional[List[str]] = None
+        self, exclude: Optional[List[str]] = None, include: Optional[List[str]] = None
     ):
         self.exclude = exclude
         self.include = include
@@ -139,7 +135,7 @@ class use_flaggems:
         self._lib = torch.library.Library("aten", "IMPL")
 
         try:
-            import flag_gems
+            import flag_gems  # noqa: F401
             from flag_gems import _FULL_CONFIG
         except ImportError:
             raise ImportError("flag_gems is required")
@@ -172,7 +168,7 @@ class use_flaggems:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self._lib is not None:
-            if hasattr(self._lib, '_destroy'):
+            if hasattr(self._lib, "_destroy"):
                 self._lib._destroy()
             del self._lib
         return False

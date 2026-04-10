@@ -20,7 +20,11 @@ This package registers FlagGems' high-performance Triton kernels as a custom PyT
 
 ```bash
 cd torch-plugin-FL
+# For CUDA platform
 pip install -e . --no-build-isolation
+
+# For MACA platform
+GPU_PLATFORM=muxi pip install -e . --no-build-isolation
 ```
 
 ## Usage
