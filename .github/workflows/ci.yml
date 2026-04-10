@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main, devops]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+  pull_request:
+    branches: [main, devops]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================================
+  # Job 1: Lint (ruff check, ruff format)
+  # ============================================================
+  lint:
+    uses: ./.github/workflows/lint.yml
+
+  # ============================================================
+  # Job 2: Build & install check
+  # ============================================================
+  build:
+    needs: lint
+    uses: ./.github/workflows/build-wheel.yml
+
+  # ============================================================
+  # Job 3: Integration tests (MACA GPU required)
+  # ============================================================
+  integration-tests:
+    needs: build
+    uses: ./.github/workflows/integration-test.yml
