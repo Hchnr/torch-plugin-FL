@@ -1,6 +1,5 @@
-# torch_flagos
 
-FlagGems operators registered as a custom PyTorch device named `flagos`.
+A PyTorch plugin built on FlagOS to provide a unified and efficient multi-chip support.
 
 ## Overview
 
